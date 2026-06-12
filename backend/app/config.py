@@ -78,6 +78,17 @@ class Settings(BaseSettings):
     risk_pct_min: float = Field(default=0.5, ge=0.0)
     risk_pct_max: float = Field(default=3.0, le=100.0)
 
+    # ── Collector ─────────────────────────────────────────────────────────────
+    collector_exchange: Literal["binance", "bybit"] = "bybit"
+    watched_symbols: list[str] = [
+        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+        "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "DOT/USDT", "LINK/USDT",
+        "MATIC/USDT", "UNI/USDT", "ATOM/USDT", "LTC/USDT", "NEAR/USDT",
+    ]
+    watched_timeframes: list[str] = ["15m", "1h", "4h"]
+    collector_heartbeat_timeout: int = 30   # seconds; reconnect if no data
+    collector_backfill_limit: int = 500     # candles per REST fetch on gap-fill
+
     @field_validator("master_encryption_key")
     @classmethod
     def validate_master_key(cls, v: str) -> str:
