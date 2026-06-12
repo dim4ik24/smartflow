@@ -65,3 +65,6 @@
 - Покриття тестами: ціль 85%+ загалом; risk.py та security/crypto.py — 100%,
   включно з крайніми випадками
 - Не коміть: .env, *.db, __pycache__, node_modules
+- Після завершення кожної задачі і успішного проходження тестів —
+  git add, коміт за conventional commits і git push origin main.
+  Якщо push не вдався — повідом про це, не ігноруй.
