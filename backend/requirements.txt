@@ -22,7 +22,6 @@ ccxt>=4.4.0
 # ── Data / analytics ──────────────────────────────────────────────────────────
 pandas>=2.2.0
 numpy>=1.26,<2.0
-# pandas-ta pinned at start of Etap 3 (0.3.14b0 no longer on PyPI; 0.4.x requires numpy>=2.2.6)
 smartmoneyconcepts>=0.0.16
 
 # ── Scheduling ────────────────────────────────────────────────────────────────
