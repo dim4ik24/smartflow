@@ -1,0 +1,50 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=app --cov-report=term-missing -q"
+
+[tool.coverage.run]
+branch = true
+source = ["app"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = [
+    "N818",   # exception names without Error suffix (our domain names)
+    "B008",   # do not perform function calls in default arguments (FastAPI Depends)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "ccxt.*",
+    "pandas_ta.*",
+    "smartmoneyconcepts.*",
+    "vectorbt.*",
+    "mplfinance.*",
+    "feedparser.*",
+    "apscheduler.*",
+    "slowapi.*",
+    "google.generativeai.*",
+]
+ignore_missing_imports = true
