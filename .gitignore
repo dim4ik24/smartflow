@@ -12,3 +12,8 @@ dist/
 secrets.env
 *.pem
 *.key
+
+# Test / coverage artifacts
+.coverage
+coverage.xml
+htmlcov/

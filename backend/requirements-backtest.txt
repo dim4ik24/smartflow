@@ -1,0 +1,10 @@
+# Backtest dependencies — needed only for scripts/backtest.py (Etap 6).
+# NOT installed in CI or production; install manually:
+#   pip install -r requirements-backtest.txt
+#
+# Heavy chain: vectorbt -> numba -> llvmlite (requires Python <3.14).
+# Use a Python 3.11/3.12 environment for backtest work.
+
+-r requirements.txt
+
+vectorbt>=0.26.0

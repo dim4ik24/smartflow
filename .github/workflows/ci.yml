@@ -42,7 +42,7 @@ jobs:
         run: mypy app --ignore-missing-imports
 
       - name: Run tests with coverage
-        run: pytest --cov=app --cov-report=xml --cov-report=term-missing -q
+        run: pytest --cov=app --cov-report=xml --cov-report=term-missing --cov-fail-under=80 -q
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
