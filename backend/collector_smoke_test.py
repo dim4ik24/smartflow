@@ -1,10 +1,6 @@
 """Smoke-test: run the collector against mainnet for ~3.5 min, then show stats.
 
-Work-around applied: sys.modules['aiodns'] = None before aiohttp is imported
-so that aiohttp falls back to ThreadedResolver (avoids pycares/aiodns DNS
-failures on Windows + Python 3.12+).
-
-Usage:  python collector_smoke_test.py
+Usage:  python collector_smoke_test.py   (requires Python 3.12 venv)
 """
 from __future__ import annotations
 
@@ -49,8 +45,6 @@ def _check_dns() -> bool:
 
 # ── Step 1: create DB tables ─────────────────────────────────────────────────
 _INIT_CODE = """\
-import sys
-sys.modules['aiodns'] = None          # force aiohttp → ThreadedResolver
 import asyncio
 from app.db.session import Base, engine
 import app.db.models
@@ -62,10 +56,7 @@ print("DB tables ready.", flush=True)
 """
 
 # ── Step 2: collector subprocess entry-point ─────────────────────────────────
-# Inlined so we avoid creating extra files. Patches aiodns before any import.
 _COLLECTOR_CODE = """\
-import sys
-sys.modules['aiodns'] = None          # force aiohttp → ThreadedResolver
 from app.collectors.run_collector import main
 main()
 """

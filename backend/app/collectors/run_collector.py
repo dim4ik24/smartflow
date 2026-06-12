@@ -10,6 +10,13 @@ import asyncio
 import logging
 import sys
 
+# On Windows, c-ares (used by pycares/aiodns) cannot read the system DNS config,
+# causing aiohttp to fail all DNS lookups. Disabling aiodns forces aiohttp to
+# use ThreadedResolver (getaddrinfo via thread pool) which works on all platforms.
+# This has no effect on Linux production servers where c-ares works correctly.
+if sys.platform == "win32":
+    sys.modules.setdefault("aiodns", None)  # type: ignore[assignment]
+
 import structlog
 
 from app.config import settings
