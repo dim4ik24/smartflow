@@ -6,7 +6,7 @@ Pure-function tests need no DB. DB tests use the db_session fixture.
 from __future__ import annotations
 
 import asyncio
-import time
+import contextlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,12 +15,13 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.collectors.market_ws import (
+    _TF_SECONDS,
     _build_exchange,
     _build_rest_exchange,
     _detect_gaps,
     _gap_fill,
     _get_last_ts,
-    _heartbeat_watcher,
+    _is_candle_closed,
     _upsert_batch,
     parse_ohlcv_row,
 )
@@ -28,22 +29,44 @@ from app.db.models import Candle
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _make_row(  # noqa: E741
-    ts: datetime,
-    o: float = 100.0,
-    h: float = 110.0,
-    low: float = 90.0,
-    c: float = 105.0,
-    v: float = 1000.0,
-) -> list[float]:
-    return [ts.timestamp() * 1000, o, h, low, c, v]
+def _row(ts_ms: int, c: float = 100.0) -> list[float]:
+    return [float(ts_ms), 99.0, 110.0, 90.0, c, 1000.0]
 
 
-# ── Pure function tests ────────────────────────────────────────────────────────
+def _past_ms(hours: int = 2) -> int:
+    """Return a timestamp `hours` hours in the past as milliseconds."""
+    return int((datetime.now(UTC) - timedelta(hours=hours)).timestamp() * 1000)
+
+
+# ── _is_candle_closed tests ────────────────────────────────────────────────────
+
+def test_is_candle_closed_forming() -> None:
+    tf_secs = 3600
+    now_ms = 1_700_000_000_000
+    # Opened 30 min ago → closes in 30 min
+    ts_ms = now_ms - 30 * 60 * 1000
+    assert not _is_candle_closed(ts_ms, tf_secs, now_ms)
+
+
+def test_is_candle_closed_exactly_at_boundary() -> None:
+    tf_secs = 3600
+    now_ms = 1_700_000_000_000
+    ts_ms = now_ms - tf_secs * 1000  # close time == now
+    assert _is_candle_closed(ts_ms, tf_secs, now_ms)
+
+
+def test_is_candle_closed_well_in_past() -> None:
+    tf_secs = 900
+    now_ms = 1_700_000_000_000
+    ts_ms = now_ms - 5 * tf_secs * 1000  # 5 intervals ago
+    assert _is_candle_closed(ts_ms, tf_secs, now_ms)
+
+
+# ── parse_ohlcv_row tests ──────────────────────────────────────────────────────
 
 def test_parse_ohlcv_row_maps_all_fields() -> None:
     ts = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
-    row = _make_row(ts, o=42000.0, h=43000.0, low=41000.0, c=42500.0, v=500.0)
+    row: list[float] = [ts.timestamp() * 1000, 42000.0, 43000.0, 41000.0, 42500.0, 500.0]
 
     candle = parse_ohlcv_row(row, "BTC/USDT", "1h")
 
@@ -59,60 +82,49 @@ def test_parse_ohlcv_row_maps_all_fields() -> None:
 
 def test_parse_ohlcv_row_timezone_is_utc() -> None:
     ts = datetime(2024, 6, 1, 0, 0, 0, tzinfo=UTC)
-    row = _make_row(ts)
+    row: list[float] = [ts.timestamp() * 1000, 100.0, 110.0, 90.0, 105.0, 1000.0]
     candle = parse_ohlcv_row(row, "ETH/USDT", "15m")
     assert candle.ts.tzinfo is not None
     assert candle.ts == ts
 
 
+# ── _detect_gaps tests ─────────────────────────────────────────────────────────
+
 def test_detect_gaps_cold_start_returns_backfill_window() -> None:
     now = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
-    tf_secs = 3600  # 1h
+    tf_secs = 3600
     limit = 10
-
     since_ms = _detect_gaps(None, now, tf_secs, limit)
-
-    expected_dt = now - timedelta(seconds=tf_secs * limit)
-    expected_ms = int(expected_dt.timestamp() * 1000)
+    expected_ms = int((now - timedelta(seconds=tf_secs * limit)).timestamp() * 1000)
     assert since_ms == expected_ms
 
 
 def test_detect_gaps_no_gap_when_current() -> None:
     tf_secs = 3600
-    # last_ts is exactly 1 interval ago — no gap
     now = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
     last_ts = now - timedelta(seconds=tf_secs)
-
-    since_ms = _detect_gaps(last_ts, now, tf_secs, 500)
-
-    assert since_ms == 0
+    assert _detect_gaps(last_ts, now, tf_secs, 500) == 0
 
 
 def test_detect_gaps_detects_gap() -> None:
     tf_secs = 3600
     now = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
-    last_ts = now - timedelta(seconds=tf_secs * 3)  # 3 intervals ago → 2-interval gap
-
+    last_ts = now - timedelta(seconds=tf_secs * 3)
     since_ms = _detect_gaps(last_ts, now, tf_secs, 500)
-
-    expected_first_missing = last_ts + timedelta(seconds=tf_secs)
-    expected_ms = int(expected_first_missing.timestamp() * 1000)
-    assert since_ms == expected_ms
-
-
-def test_detect_gaps_exactly_two_intervals_returns_gap() -> None:
-    tf_secs = 900  # 15m
-    now = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
-    last_ts = now - timedelta(seconds=tf_secs * 2)
-
-    since_ms = _detect_gaps(last_ts, now, tf_secs, 500)
-
-    # elapsed_intervals = 2 > 1 → gap detected
     expected_ms = int((last_ts + timedelta(seconds=tf_secs)).timestamp() * 1000)
     assert since_ms == expected_ms
 
 
-# ── DB tests ───────────────────────────────────────────────────────────────────
+def test_detect_gaps_exactly_two_intervals_returns_gap() -> None:
+    tf_secs = 900
+    now = datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
+    last_ts = now - timedelta(seconds=tf_secs * 2)
+    since_ms = _detect_gaps(last_ts, now, tf_secs, 500)
+    expected_ms = int((last_ts + timedelta(seconds=tf_secs)).timestamp() * 1000)
+    assert since_ms == expected_ms
+
+
+# ── _upsert_batch tests ────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_upsert_batch_insert_then_update(db_session: AsyncSession) -> None:
@@ -146,45 +158,189 @@ async def test_upsert_batch_insert_then_update(db_session: AsyncSession) -> None
 
 
 @pytest.mark.asyncio
-async def test_skip_open_candle_only_closed_inserted(db_session: AsyncSession) -> None:
-    """3 rows submitted → only the first 2 (closed candles) should be upserted."""
+async def test_upsert_batch_empty_list_is_noop(db_session: AsyncSession) -> None:
+    await _upsert_batch([], db_session)  # must not raise
+
+
+# ── Time-based candle closure in WS loop ──────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_forming_candle_not_stored_closed_candle_is_stored(
+    db_session: AsyncSession,
+) -> None:
+    """Candle whose close time is in the future must not be upserted; a closed
+    candle with the same symbol/tf that later satisfies _is_candle_closed must be."""
     from sqlalchemy import func, select
 
     from app.db.models import Candle as CandleModel
 
-    ts_base = datetime(2024, 4, 1, 8, 0, 0, tzinfo=UTC)
-    rows: list[list[float]] = [
-        _make_row(ts_base, c=100.0),
-        _make_row(ts_base + timedelta(hours=1), c=101.0),
-        _make_row(ts_base + timedelta(hours=2), c=102.0),  # still-forming, must be skipped
+    tf_secs = _TF_SECONDS["1h"]
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+
+    # Forming: opened 30 min ago → closes in 30 min
+    forming_ts_ms = now_ms - 30 * 60 * 1000
+    # Closed: opened 3 h ago → close was 2 h ago
+    closed_ts_ms = now_ms - 3 * tf_secs * 1000
+
+    rows = [_row(closed_ts_ms, c=100.0), _row(forming_ts_ms, c=101.0)]
+
+    batch = [
+        parse_ohlcv_row(r, "AVAX/USDT", "1h")
+        for r in rows
+        if _is_candle_closed(int(r[0]), tf_secs, now_ms)
     ]
+    await _upsert_batch(batch, db_session)
 
-    # Simulate the collector's skipping of the last row (rows[:-1])
-    closed_rows = rows[:-1]
-    candles = [parse_ohlcv_row(r, "ETH/USDT", "1h") for r in closed_rows]
-    await _upsert_batch(candles, db_session)
-
-    count_result = await db_session.execute(
-        select(func.count()).where(
-            CandleModel.symbol == "ETH/USDT",
-            CandleModel.timeframe == "1h",
+    count = (
+        await db_session.execute(
+            select(func.count()).where(
+                CandleModel.symbol == "AVAX/USDT",
+                CandleModel.timeframe == "1h",
+            )
         )
+    ).scalar_one()
+    assert count == 1  # forming candle was skipped
+
+    # Simulate the same candle now closed (advance its ts to the past)
+    closed_forming = Candle(
+        symbol="AVAX/USDT",
+        timeframe="1h",
+        ts=datetime.fromtimestamp(forming_ts_ms / 1000, tz=UTC),
+        o=99.0, h=109.0, l=89.0, c=101.0, v=1000.0,
     )
-    count = count_result.scalar_one()
-    assert count == 2
+    # "now" has advanced enough that forming_ts_ms + tf_secs*1000 <= new_now_ms
+    new_now_ms = forming_ts_ms + tf_secs * 1000 + 1
+    assert _is_candle_closed(forming_ts_ms, tf_secs, new_now_ms)
+    await _upsert_batch([closed_forming], db_session)
+
+    count2 = (
+        await db_session.execute(
+            select(func.count()).where(
+                CandleModel.symbol == "AVAX/USDT",
+                CandleModel.timeframe == "1h",
+            )
+        )
+    ).scalar_one()
+    assert count2 == 2
+
+
+# ── _gap_fill tests ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_gap_fill_time_based_skips_forming_candle(db_session: AsyncSession) -> None:
+    """A candle that hasn't closed (ts + tf_secs > now) must not be upserted."""
+    from sqlalchemy import func, select
+
+    from app.db.models import Candle as CandleModel
+
+    tf_secs = _TF_SECONDS["1h"]
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+
+    closed_ts_ms = now_ms - 3 * tf_secs * 1000   # closed 2 h ago
+    forming_ts_ms = now_ms - 30 * 60 * 1000       # closes in 30 min
+
+    rows = [_row(closed_ts_ms, c=200.0), _row(forming_ts_ms, c=201.0)]
+    fake_rest = MagicMock()
+    fake_rest.fetch_ohlcv = AsyncMock(return_value=rows)
+
+    await _gap_fill(fake_rest, "NEAR/USDT", "1h", closed_ts_ms, 10, db_session)
+
+    count = (
+        await db_session.execute(
+            select(func.count()).where(
+                CandleModel.symbol == "NEAR/USDT",
+                CandleModel.timeframe == "1h",
+            )
+        )
+    ).scalar_one()
+    assert count == 1
 
 
 @pytest.mark.asyncio
-async def test_upsert_batch_empty_list_is_noop(db_session: AsyncSession) -> None:
-    """Calling _upsert_batch with an empty list should not raise."""
-    await _upsert_batch([], db_session)  # must not raise
+async def test_gap_fill_single_forming_candle_not_stored(db_session: AsyncSession) -> None:
+    """Edge-case: REST returns exactly 1 row that is still forming → nothing stored."""
+    from sqlalchemy import func, select
+
+    from app.db.models import Candle as CandleModel
+
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    forming_ts_ms = now_ms - 10 * 60 * 1000  # 10 min ago, closes in 50 min
+
+    fake_rest = MagicMock()
+    fake_rest.fetch_ohlcv = AsyncMock(return_value=[_row(forming_ts_ms)])
+
+    await _gap_fill(fake_rest, "UNI/USDT", "1h", forming_ts_ms, 10, db_session)
+
+    count = (
+        await db_session.execute(
+            select(func.count()).where(
+                CandleModel.symbol == "UNI/USDT",
+                CandleModel.timeframe == "1h",
+            )
+        )
+    ).scalar_one()
+    assert count == 0
 
 
-# ── Reconnect backoff test ─────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_gap_fill_multi_page_fetches_until_last_page(db_session: AsyncSession) -> None:
+    """If the first page is full (len == limit), _gap_fill fetches the next page."""
+    from sqlalchemy import func, select
+
+    from app.db.models import Candle as CandleModel
+
+    tf_secs = _TF_SECONDS["1h"]
+    # Use timestamps well in the past so all rows are closed
+    base_ms = _past_ms(hours=10)
+
+    page1 = [_row(base_ms + i * tf_secs * 1000, c=float(i)) for i in range(3)]
+    page2 = [_row(base_ms + 3 * tf_secs * 1000, c=3.0)]  # 1 row < limit → last page
+
+    fetch_calls: list[int] = []
+
+    async def fake_fetch(symbol: str, timeframe: str, since: int, limit: int) -> list[list[float]]:
+        fetch_calls.append(since)
+        return page1 if len(fetch_calls) == 1 else page2
+
+    fake_rest = MagicMock()
+    fake_rest.fetch_ohlcv = fake_fetch
+
+    await _gap_fill(fake_rest, "DOT/USDT", "1h", base_ms, limit=3, session=db_session)
+
+    assert len(fetch_calls) == 2, "expected exactly 2 pages fetched"
+
+    count = (
+        await db_session.execute(
+            select(func.count()).where(
+                CandleModel.symbol == "DOT/USDT",
+                CandleModel.timeframe == "1h",
+            )
+        )
+    ).scalar_one()
+    assert count == 4
+
+
+@pytest.mark.asyncio
+async def test_gap_fill_exhausted_retries_returns_without_raising(db_session: AsyncSession) -> None:
+    from ccxt.base.errors import NetworkError
+
+    fake_rest = MagicMock()
+    fake_rest.fetch_ohlcv = AsyncMock(side_effect=NetworkError("timeout"))
+
+    async def fast_sleep(_: float) -> None:
+        pass
+
+    with patch("asyncio.sleep", fast_sleep):
+        await _gap_fill(fake_rest, "ATOM/USDT", "1h", 0, 10, db_session)
+
+    assert fake_rest.fetch_ohlcv.call_count == 5
+
+
+# ── Reconnect / backoff tests ──────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_reconnect_backoff_doubles_and_caps() -> None:
-    """_run_timeframe_task must double backoff on each network error, capping at 60s."""
+    """_run_timeframe_task doubles backoff on each NetworkError, capping at 60 s."""
     from ccxt.base.errors import NetworkError
 
     from app.collectors.market_ws import _run_timeframe_task
@@ -234,53 +390,96 @@ async def test_reconnect_backoff_doubles_and_caps() -> None:
     assert all(s <= 60.0 for s in sleep_calls)
 
 
+@pytest.mark.asyncio
+async def test_ws_timeout_triggers_reconnect() -> None:
+    """A TimeoutError from wait_for must cause a reconnect (gap-fill called again)."""
+    from app.collectors.market_ws import _run_timeframe_task
+
+    gap_fill_calls: list[int] = []
+
+    async def fake_gap_fill(*_: Any, **__: Any) -> None:
+        gap_fill_calls.append(1)
+
+    async def fake_get_last_ts(*_: Any) -> None:
+        return None
+
+    wf_calls = 0
+
+    async def fake_wait_for(coro: Any, timeout: float = 0, **_: Any) -> Any:
+        nonlocal wf_calls
+        wf_calls += 1
+        with contextlib.suppress(Exception):
+            coro.close()
+        if wf_calls == 1:
+            raise TimeoutError  # first call → heartbeat timeout → reconnect
+        raise asyncio.CancelledError  # second call → shut down
+
+    class FakeSettings:
+        watched_symbols = ["BTC/USDT"]
+        collector_backfill_limit = 10
+        collector_heartbeat_timeout = 30
+
+    fake_ws = MagicMock()
+    fake_ws.watch_ohlcv_for_symbols = AsyncMock()
+    fake_rest = MagicMock()
+
+    with (
+        patch("asyncio.wait_for", fake_wait_for),
+        patch("app.collectors.market_ws._get_last_ts", fake_get_last_ts),
+        patch("app.collectors.market_ws._gap_fill", fake_gap_fill),
+        patch("app.collectors.market_ws.AsyncSessionLocal"),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await _run_timeframe_task("1h", fake_ws, fake_rest, FakeSettings())
+
+    # gap-fill must have run twice: initial connect + after timeout reconnect
+    assert len(gap_fill_calls) == 2
+    assert wf_calls == 2
+
+
 # ── Integration test — fake WS data → DB ──────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_integration_fake_ws_data_upserts_closed_candles(db_session: AsyncSession) -> None:
-    """Simulate WS data processing: 3 rows arrive, only 2 (closed) end up in DB."""
+async def test_integration_fake_ws_data_upserts_only_closed_candles(
+    db_session: AsyncSession,
+) -> None:
+    """End-to-end: WS data with 2 closed rows + 1 forming → only 2 in DB."""
     from sqlalchemy import func, select
 
     from app.db.models import Candle as CandleModel
 
-    ts_base = datetime(2024, 5, 10, 6, 0, 0, tzinfo=UTC)
+    tf_secs = _TF_SECONDS["15m"]
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
     symbol = "SOL/USDT"
     timeframe = "15m"
 
-    row0 = _make_row(ts_base, c=150.0)
-    row1 = _make_row(ts_base + timedelta(minutes=15), c=151.0)
-    row_open = _make_row(ts_base + timedelta(minutes=30), c=152.0)  # still-forming
+    closed1_ms = now_ms - 3 * tf_secs * 1000
+    closed2_ms = now_ms - 2 * tf_secs * 1000
+    forming_ms = now_ms - 5 * 60 * 1000  # 5 min ago, closes in 10 min
 
     fake_data: dict[str, dict[str, list[list[float]]]] = {
-        symbol: {timeframe: [row0, row1, row_open]}
+        symbol: {
+            timeframe: [_row(closed1_ms, 150.0), _row(closed2_ms, 151.0), _row(forming_ms, 152.0)]
+        }
     }
 
     batch: list[Candle] = []
     for sym, tf_data in fake_data.items():
-        rows = tf_data.get(timeframe, [])
-        for row in rows[:-1]:
-            batch.append(parse_ohlcv_row(row, sym, timeframe))
+        for row in tf_data.get(timeframe, []):
+            if _is_candle_closed(int(row[0]), tf_secs, now_ms):
+                batch.append(parse_ohlcv_row(row, sym, timeframe))
 
     await _upsert_batch(batch, db_session)
 
-    count_result = await db_session.execute(
-        select(func.count()).where(
-            CandleModel.symbol == symbol,
-            CandleModel.timeframe == timeframe,
+    count = (
+        await db_session.execute(
+            select(func.count()).where(
+                CandleModel.symbol == symbol,
+                CandleModel.timeframe == timeframe,
+            )
         )
-    )
-    count = count_result.scalar_one()
+    ).scalar_one()
     assert count == 2
-
-    result = await db_session.execute(
-        select(CandleModel).where(
-            CandleModel.symbol == symbol,
-            CandleModel.timeframe == timeframe,
-            CandleModel.ts == ts_base + timedelta(minutes=15),
-        )
-    )
-    second_candle = result.scalar_one()
-    assert second_candle.c == 151.0
 
 
 # ── _get_last_ts tests ─────────────────────────────────────────────────────────
@@ -304,95 +503,6 @@ async def test_get_last_ts_returns_newest_timestamp(db_session: AsyncSession) ->
     # SQLite strips timezone on storage; compare only the naive value
     assert result is not None
     assert result.replace(tzinfo=None) == ts2.replace(tzinfo=None)
-
-
-# ── _gap_fill tests ────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_gap_fill_success_upserts_closed_rows(db_session: AsyncSession) -> None:
-    from sqlalchemy import func, select
-
-    from app.db.models import Candle as CandleModel
-
-    ts_base = datetime(2024, 7, 1, 0, 0, 0, tzinfo=UTC)
-    rows = [
-        _make_row(ts_base, c=100.0),
-        _make_row(ts_base + timedelta(hours=1), c=101.0),
-        _make_row(ts_base + timedelta(hours=2), c=102.0),  # last row (forming), skipped
-    ]
-
-    fake_rest = MagicMock()
-    fake_rest.fetch_ohlcv = AsyncMock(return_value=rows)
-
-    since_ms = int(ts_base.timestamp() * 1000)
-    await _gap_fill(fake_rest, "LINK/USDT", "1h", since_ms, 10, db_session)
-
-    count = (
-        await db_session.execute(
-            select(func.count()).where(
-                CandleModel.symbol == "LINK/USDT",
-                CandleModel.timeframe == "1h",
-            )
-        )
-    ).scalar_one()
-    assert count == 2
-
-
-@pytest.mark.asyncio
-async def test_gap_fill_exhausted_retries_returns_without_raising(db_session: AsyncSession) -> None:
-    from ccxt.base.errors import NetworkError
-
-    fake_rest = MagicMock()
-    fake_rest.fetch_ohlcv = AsyncMock(side_effect=NetworkError("timeout"))
-
-    async def fast_sleep(_: float) -> None:
-        pass
-
-    with patch("asyncio.sleep", fast_sleep):
-        # Returns silently after 5 failed attempts
-        await _gap_fill(fake_rest, "ATOM/USDT", "1h", 0, 10, db_session)
-
-    assert fake_rest.fetch_ohlcv.call_count == 5
-
-
-# ── _heartbeat_watcher tests ───────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_heartbeat_watcher_triggers_cancel_event_when_stale() -> None:
-    cancel_event = asyncio.Event()
-    # Simulate data that arrived 1000 s ago — well past any timeout
-    last_ref: list[float] = [time.monotonic() - 1000]
-
-    async def fast_sleep(_: float) -> None:
-        pass
-
-    with patch("asyncio.sleep", fast_sleep):
-        await _heartbeat_watcher(last_ref, 30, cancel_event, "test_task")
-
-    assert cancel_event.is_set()
-
-
-@pytest.mark.asyncio
-async def test_heartbeat_watcher_does_not_trigger_when_fresh() -> None:
-    """When data is fresh the watcher must not set the event on the first check."""
-    cancel_event = asyncio.Event()
-    last_ref: list[float] = [time.monotonic()]  # just now
-
-    iteration = 0
-
-    async def fake_sleep(_: float) -> None:
-        nonlocal iteration
-        iteration += 1
-        if iteration >= 2:
-            # Force exit by setting the event externally after 2 ticks
-            cancel_event.set()
-
-    with patch("asyncio.sleep", fake_sleep):
-        await _heartbeat_watcher(last_ref, 30, cancel_event, "test_fresh")
-
-    # Event set externally after 2 ticks — not triggered by stale data
-    assert cancel_event.is_set()
-    assert iteration == 2
 
 
 # ── Exchange builder tests ─────────────────────────────────────────────────────

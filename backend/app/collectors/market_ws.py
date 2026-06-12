@@ -8,10 +8,8 @@ On every (re)connect the task gap-fills missing candles via REST.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import functools
 import signal
-import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -64,6 +62,17 @@ def parse_ohlcv_row(row: list[float], symbol: str, timeframe: str) -> Candle:
     ts_ms, o, h, l, c, v = row  # noqa: E741 — OHLCV convention
     ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=UTC)
     return Candle(symbol=symbol, timeframe=timeframe, ts=ts, o=o, h=h, l=l, c=c, v=v)
+
+
+def _is_candle_closed(ts_ms: int, tf_secs: int, now_ms: int) -> bool:
+    """Return True if the candle opened at ts_ms has already closed.
+
+    A candle opened at ts_ms closes at ts_ms + tf_secs*1000. Comparing against
+    wall-clock time is more reliable than skipping the last element positionally,
+    which breaks when ccxt returns only the current (forming) candle in newUpdates
+    mode.
+    """
+    return ts_ms + tf_secs * 1000 <= now_ms
 
 
 def _detect_gaps(
@@ -122,9 +131,11 @@ async def _gap_fill(
     limit: int,
     session: AsyncSession,
 ) -> None:
-    """Fetch candles missing since `since_ms` via REST and upsert them.
+    """Fetch all missing closed candles since `since_ms` via REST and upsert them.
 
-    Retries up to 5 times with exponential backoff on transient network errors.
+    Loops over pages until fewer than `limit` rows are returned or the last row
+    in a page is still forming. Each page retries up to 5 times with exponential
+    backoff on transient network errors.
     """
     from ccxt.base.errors import (
         ExchangeNotAvailable,
@@ -133,53 +144,50 @@ async def _gap_fill(
         RequestTimeout,
     )
 
-    backoff = 1.0
-    rows: list[list[float]] = []
-    for attempt in range(5):
-        try:
-            rows = await rest_ex.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+    tf_secs = _TF_SECONDS[timeframe]
+    total = 0
+
+    while True:
+        backoff = 1.0
+        rows: list[list[float]] = []
+        for attempt in range(5):
+            try:
+                rows = await rest_ex.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+                break
+            except RateLimitExceeded:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+            except (NetworkError, ExchangeNotAvailable, RequestTimeout) as exc:
+                log.warning(
+                    "gap_fill_fetch_failed",
+                    symbol=symbol,
+                    tf=timeframe,
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+        else:
+            log.error("gap_fill_exhausted_retries", symbol=symbol, tf=timeframe)
             break
-        except RateLimitExceeded:
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
-        except (NetworkError, ExchangeNotAvailable, RequestTimeout) as exc:
-            log.warning(
-                "gap_fill_fetch_failed",
-                symbol=symbol,
-                tf=timeframe,
-                attempt=attempt,
-                error=str(exc),
-            )
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
-    else:
-        log.error("gap_fill_exhausted_retries", symbol=symbol, tf=timeframe)
-        return
 
-    # Skip the last row — it may still be forming at the time of the REST call
-    closed = rows[:-1] if len(rows) > 1 else rows
-    candles = [parse_ohlcv_row(r, symbol, timeframe) for r in closed]
-    await _upsert_batch(candles, session)
-    log.info("gap_fill_complete", symbol=symbol, tf=timeframe, count=len(candles))
+        if not rows:
+            break
 
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        closed = [r for r in rows if _is_candle_closed(int(r[0]), tf_secs, now_ms)]
+        if closed:
+            candles = [parse_ohlcv_row(r, symbol, timeframe) for r in closed]
+            await _upsert_batch(candles, session)
+            total += len(closed)
 
-# ── Heartbeat ─────────────────────────────────────────────────────────────────
+        # Stop if this was the last page or the last row is still forming
+        if len(rows) < limit or not _is_candle_closed(int(rows[-1][0]), tf_secs, now_ms):
+            break
+        since_ms = int(rows[-1][0]) + tf_secs * 1000
 
-
-async def _heartbeat_watcher(
-    last_received_ref: list[float],
-    timeout: int,
-    cancel_event: asyncio.Event,
-    task_name: str,
-) -> None:
-    """Signal cancel_event if no WS data arrives within `timeout` seconds."""
-    interval = max(timeout // 3, 5)
-    while not cancel_event.is_set():
-        await asyncio.sleep(interval)
-        age = time.monotonic() - last_received_ref[0]
-        if age > timeout:
-            log.warning("heartbeat_timeout", task=task_name, age_secs=round(age, 1))
-            cancel_event.set()
+    if total:
+        log.info("gap_fill_complete", symbol=symbol, tf=timeframe, count=total)
 
 
 # ── Per-timeframe WS task ────────────────────────────────────────────────────
@@ -193,8 +201,11 @@ async def _run_timeframe_task(
 ) -> None:
     """Run the WebSocket receive loop for one timeframe with auto-reconnect.
 
-    Backoff resets only after the first successful batch of data is received,
-    so repeated immediate failures accumulate delay correctly.
+    Heartbeat is implemented via asyncio.wait_for: if watch_ohlcv_for_symbols
+    does not yield within collector_heartbeat_timeout seconds the receive loop
+    breaks and triggers a full reconnect (including gap-fill).
+
+    Backoff resets only after the first successful data batch is received.
     """
     from ccxt.base.errors import (
         ExchangeNotAvailable,
@@ -223,48 +234,34 @@ async def _run_timeframe_task(
                         )
 
             bound_log.info("ws_connected", symbols=len(s.watched_symbols))
-
-            # ── Heartbeat ──────────────────────────────────────────────────────
-            last_received_ref: list[float] = [time.monotonic()]
-            cancel_event = asyncio.Event()
-            hb_task = asyncio.create_task(
-                _heartbeat_watcher(
-                    last_received_ref,
-                    s.collector_heartbeat_timeout,
-                    cancel_event,
-                    f"ws_{timeframe}",
-                )
-            )
-
             is_first_batch = True
-            try:
-                while not cancel_event.is_set():
-                    data: dict[str, dict[str, list[list[float]]]] = (
-                        await ws_ex.watch_ohlcv_for_symbols(sym_tf_pairs)
+
+            # ── Receive loop (heartbeat via wait_for) ──────────────────────────
+            while True:
+                try:
+                    data: dict[str, dict[str, list[list[float]]]] = await asyncio.wait_for(
+                        ws_ex.watch_ohlcv_for_symbols(sym_tf_pairs),
+                        timeout=s.collector_heartbeat_timeout,
                     )
-                    last_received_ref[0] = time.monotonic()
+                except TimeoutError:
+                    bound_log.warning("ws_heartbeat_timeout_reconnect")
+                    break  # exit receive loop → reconnect
 
-                    if is_first_batch:
-                        backoff = 1.0  # confirmed live; reset backoff
-                        is_first_batch = False
+                if is_first_batch:
+                    backoff = 1.0  # confirmed live; reset backoff
+                    is_first_batch = False
 
-                    batch: list[Candle] = []
-                    for sym, tf_data in data.items():
-                        rows = tf_data.get(timeframe, [])
-                        for row in rows[:-1]:  # skip last (still-forming) candle
+                now_ms = int(datetime.now(UTC).timestamp() * 1000)
+                batch: list[Candle] = []
+                for sym, tf_data in data.items():
+                    for row in tf_data.get(timeframe, []):
+                        if _is_candle_closed(int(row[0]), tf_secs, now_ms):
                             batch.append(parse_ohlcv_row(row, sym, timeframe))
 
-                    if batch:
-                        async with AsyncSessionLocal() as session:
-                            await _upsert_batch(batch, session)
-                        bound_log.debug("candles_upserted", count=len(batch))
-
-            finally:
-                hb_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await hb_task
-
-            bound_log.warning("heartbeat_triggered_reconnect")
+                if batch:
+                    async with AsyncSessionLocal() as session:
+                        await _upsert_batch(batch, session)
+                    bound_log.debug("candles_upserted", count=len(batch))
 
         except asyncio.CancelledError:
             bound_log.info("task_cancelled")
