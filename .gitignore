@@ -1,0 +1,14 @@
+.env
+*.db
+*.sqlite3
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+dist/
+.wrangler/
+secrets.env
+*.pem
+*.key
