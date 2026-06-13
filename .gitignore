@@ -17,3 +17,6 @@ secrets.env
 .coverage
 coverage.xml
 htmlcov/
+
+# Logs
+*.log
