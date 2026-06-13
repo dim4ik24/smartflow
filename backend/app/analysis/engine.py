@@ -2,11 +2,14 @@
 
 ``analyze_symbol_on_close`` is called whenever a candle closes:
   1. Load OHLCV from DB (4h context + entry TF)
-  2. Run SMC analysis (confirmed_only=True to avoid lookahead bias)
-  3. Determine trade side from 4h structural direction
-  4. Fetch derivatives and news sentiment
-  5. Score via scoring.py
-  6. If score >= signal_min_score and no macro gate → create Signal in DB
+  2. Idempotency check — skip if the latest candle was already analysed
+  3. Run SMC analysis (confirmed_only=True to avoid lookahead bias)
+  4. Determine trade side from 4h structural direction
+  5. Fetch derivatives and news sentiment
+  6. Score via scoring.py
+  7. Deduplication — skip if an active Signal already covers the same zone
+  8. If score >= signal_min_score and no macro gate → create Signal in DB
+  9. Always persist AnalysisState so repeated calls on the same candle are no-ops
 
 The caller is responsible for committing the session; this function only flushes
 so that the returned Signal already has an assigned ID.
@@ -25,7 +28,7 @@ from app.analysis import indicators, smc
 from app.analysis.scoring import detect_structure_direction, score_setup
 from app.collectors.derivatives import get_latest_derivatives, get_prev_derivatives
 from app.config import settings
-from app.db.models import Candle, MarketSentiment, NewsItem, Signal
+from app.db.models import AnalysisState, Candle, MarketSentiment, NewsItem, Signal
 from app.db.session import AsyncSessionLocal
 
 log = structlog.get_logger(__name__)
@@ -73,6 +76,52 @@ def _avg_sentiment(news: list[NewsItem]) -> float | None:
     return sum(s * w for s, w in scored) / total_w
 
 
+async def _find_duplicate_signal(
+    symbol: str,
+    timeframe: str,
+    side: str,
+    entry_low: float,
+    entry_high: float,
+    session: AsyncSession,
+) -> Signal | None:
+    """Return an existing active Signal whose entry zone overlaps [entry_low, entry_high].
+
+    Overlap condition: existing.entry_low <= new_entry_high
+                   AND existing.entry_high >= new_entry_low
+    """
+    result = await session.execute(
+        select(Signal).where(
+            Signal.symbol == symbol,
+            Signal.timeframe == timeframe,
+            Signal.side == side,
+            Signal.status == "active",
+            Signal.entry_low <= entry_high,
+            Signal.entry_high >= entry_low,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _update_analysis_state(
+    symbol: str,
+    timeframe: str,
+    candle_ts: datetime,
+    session: AsyncSession,
+) -> None:
+    """Upsert the AnalysisState row for (symbol, timeframe)."""
+    state_result = await session.execute(
+        select(AnalysisState).where(
+            AnalysisState.symbol == symbol,
+            AnalysisState.timeframe == timeframe,
+        )
+    )
+    state = state_result.scalar_one_or_none()
+    if state is None:
+        session.add(AnalysisState(symbol=symbol, timeframe=timeframe, last_candle_ts=candle_ts))
+    else:
+        state.last_candle_ts = candle_ts
+
+
 # ── Core pipeline ─────────────────────────────────────────────────────────────
 
 async def analyze_symbol_on_close(
@@ -82,8 +131,11 @@ async def analyze_symbol_on_close(
 ) -> Signal | None:
     """Run the full analysis pipeline for one symbol+timeframe on candle close.
 
+    Idempotent: returns None immediately when the latest candle was already
+    analysed in a previous call. Always updates AnalysisState on completion so
+    the caller can unconditionally commit without re-running logic next cycle.
+
     Returns the new Signal (flushed but not committed) or None.
-    The caller decides whether to commit (real flow) or roll back (tests).
     """
     # 1. Load candles ─────────────────────────────────────────────────────────
     limit    = settings.analysis_candle_limit
@@ -98,7 +150,35 @@ async def analyze_symbol_on_close(
         )
         return None
 
-    # 2. SMC analysis — include_mitigated=True so LIQ_SWEEP zones are visible ─
+    # 2. Idempotency check — skip if we already analysed this candle ──────────
+    latest_ts_raw = entry_df.index[-1]
+    latest_candle_ts: datetime = latest_ts_raw.to_pydatetime()
+    if latest_candle_ts.tzinfo is None:
+        latest_candle_ts = latest_candle_ts.replace(tzinfo=UTC)
+
+    state_result = await session.execute(
+        select(AnalysisState).where(
+            AnalysisState.symbol == symbol,
+            AnalysisState.timeframe == trigger_timeframe,
+        )
+    )
+    state = state_result.scalar_one_or_none()
+    if state is not None:
+        # SQLite may return naive datetimes even from DateTime(timezone=True) columns.
+        state_ts = state.last_candle_ts
+        if state_ts.tzinfo is None:
+            state_ts = state_ts.replace(tzinfo=UTC)
+        already_analysed = state_ts >= latest_candle_ts
+    else:
+        already_analysed = False
+    if already_analysed:
+        log.debug(
+            "engine_already_analysed",
+            symbol=symbol, tf=trigger_timeframe, ts=latest_candle_ts,
+        )
+        return None
+
+    # 3. SMC analysis — include_mitigated=True so LIQ_SWEEP zones are visible ─
     try:
         zones_ctx   = smc.analyze(ctx_df,   confirmed_only=True, include_mitigated=True)
         zones_entry = smc.analyze(entry_df, confirmed_only=True, include_mitigated=True)
@@ -106,13 +186,13 @@ async def analyze_symbol_on_close(
         log.warning("engine_smc_failed", symbol=symbol, error=str(exc))
         return None
 
-    # 3. Trade direction from 4h structural context ───────────────────────────
+    # 4. Trade direction from 4h structural context ───────────────────────────
     side = detect_structure_direction(zones_ctx)
     if side is None:
         log.debug("engine_no_direction", symbol=symbol)
         return None
 
-    # 4. Supporting data ───────────────────────────────────────────────────────
+    # 5. Supporting data ───────────────────────────────────────────────────────
     derivatives, prev_derivatives = await asyncio.gather(
         get_latest_derivatives(symbol, session),
         get_prev_derivatives(symbol, session),
@@ -129,7 +209,7 @@ async def analyze_symbol_on_close(
     relevant = [n for n in all_recent if symbol in (n.symbols or [])]
     avg_sent = _avg_sentiment(relevant)
 
-    # 5. Fear & Greed (informational; macro gate is a future FOMC/CPI calendar) ─
+    # 6. Fear & Greed (informational; macro gate is a future FOMC/CPI calendar) ─
     fg_row = (
         await session.execute(
             select(MarketSentiment).order_by(MarketSentiment.ts.desc()).limit(1)
@@ -139,15 +219,17 @@ async def analyze_symbol_on_close(
 
     macro_flag = False  # placeholder; implement FOMC/CPI calendar in a later etap
 
-    # 6. ATR from entry timeframe ──────────────────────────────────────────────
+    # 7. ATR from entry timeframe ──────────────────────────────────────────────
     atr_series   = indicators.atr(entry_df)
     last_atr_val = atr_series.iloc[-1]
     if pd.isna(last_atr_val) or float(last_atr_val) <= 0:
         log.warning("engine_atr_invalid", symbol=symbol, atr=last_atr_val)
+        await _update_analysis_state(symbol, trigger_timeframe, latest_candle_ts, session)
+        await session.flush()
         return None
     current_atr = float(last_atr_val)
 
-    # 7. Score ────────────────────────────────────────────────────────────────
+    # 8. Score ────────────────────────────────────────────────────────────────
     current_price = float(entry_df["close"].iloc[-1])
     result = score_setup(
         symbol=symbol,
@@ -162,21 +244,41 @@ async def analyze_symbol_on_close(
     )
     if result is None:
         log.debug("engine_no_valid_setup", symbol=symbol, side=side)
+        await _update_analysis_state(symbol, trigger_timeframe, latest_candle_ts, session)
+        await session.flush()
         return None
 
-    # 8. Threshold and macro gate ──────────────────────────────────────────────
+    # 9. Threshold and macro gate ──────────────────────────────────────────────
     if result.score < settings.signal_min_score:
         log.debug(
             "engine_score_below_threshold",
             symbol=symbol, score=result.score, threshold=settings.signal_min_score,
         )
+        await _update_analysis_state(symbol, trigger_timeframe, latest_candle_ts, session)
+        await session.flush()
         return None
 
     if macro_flag:
         log.info("engine_macro_gate_active", symbol=symbol)
+        await _update_analysis_state(symbol, trigger_timeframe, latest_candle_ts, session)
+        await session.flush()
         return None
 
-    # 9. Persist signal ────────────────────────────────────────────────────────
+    # 10. Deduplication ────────────────────────────────────────────────────────
+    duplicate = await _find_duplicate_signal(
+        symbol, trigger_timeframe, result.side,
+        result.entry_low, result.entry_high, session,
+    )
+    if duplicate is not None:
+        log.debug(
+            "engine_duplicate_signal",
+            symbol=symbol, side=result.side, existing_id=duplicate.id,
+        )
+        await _update_analysis_state(symbol, trigger_timeframe, latest_candle_ts, session)
+        await session.flush()
+        return None
+
+    # 11. Persist signal ───────────────────────────────────────────────────────
     signal = Signal(
         symbol=symbol,
         side=result.side,
@@ -193,7 +295,8 @@ async def analyze_symbol_on_close(
         status="active",
     )
     session.add(signal)
-    await session.flush()   # assign ID; caller commits or rolls back
+    await _update_analysis_state(symbol, trigger_timeframe, latest_candle_ts, session)
+    await session.flush()   # assigns Signal.id and persists AnalysisState in this tx
     log.info(
         "engine_signal_created",
         symbol=symbol, side=side, score=result.score, signal_id=signal.id,
@@ -207,6 +310,8 @@ async def run_analysis_cycle() -> None:
     """Iterate over all watched symbols and entry timeframes on candle close.
 
     Each symbol+TF runs in its own session so one failure does not block others.
+    Always commits after each call: AnalysisState must persist even when no
+    signal was produced, to prevent re-analysis of the same candle next cycle.
     """
     entry_tfs = [tf for tf in settings.watched_timeframes if tf != "4h"]
     for symbol in settings.watched_symbols:
@@ -214,8 +319,8 @@ async def run_analysis_cycle() -> None:
             try:
                 async with AsyncSessionLocal() as session:
                     signal = await analyze_symbol_on_close(symbol, tf, session)
+                    await session.commit()   # always: persists AnalysisState + optional Signal
                     if signal:
-                        await session.commit()
                         log.info("engine_cycle_signal", symbol=symbol, tf=tf, id=signal.id)
             except Exception as exc:
                 log.error("engine_cycle_error", symbol=symbol, tf=tf, error=str(exc))

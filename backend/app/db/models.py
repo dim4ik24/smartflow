@@ -242,6 +242,25 @@ class DerivativesSnapshot(Base):
     long_short_ratio: Mapped[float | None] = mapped_column(sa.Float, nullable=True)
 
 
+# ── analysis_state ───────────────────────────────────────────────────────────
+
+class AnalysisState(Base):
+    """Tracks the last candle timestamp analyzed per (symbol, timeframe).
+
+    Used to make analyze_symbol_on_close idempotent: if the latest candle in
+    the DB has already been analyzed, the function returns None immediately.
+    Composite primary key — no surrogate ID needed.
+    """
+
+    __tablename__ = "analysis_state"
+
+    symbol: Mapped[str] = mapped_column(sa.String(20), primary_key=True)
+    timeframe: Mapped[str] = mapped_column(sa.String(5), primary_key=True)
+    last_candle_ts: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False
+    )
+
+
 # ── market_sentiment ──────────────────────────────────────────────────────────
 
 class MarketSentiment(Base):
