@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.0-flash"
     sentiment_batch_size: int = 20
     sentiment_analyze_interval_minutes: int = 10
+    derivatives_collect_interval_minutes: int = 5
 
     # ── Data sources (no API keys required) ──────────────────────────────────
     fear_greed_url: str = "https://api.alternative.me/fng/"

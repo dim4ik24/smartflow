@@ -224,6 +224,24 @@ class Payment(Base):
     user: Mapped[User] = relationship(back_populates="payments")
 
 
+# ── derivatives_snapshot ─────────────────────────────────────────────────────
+
+class DerivativesSnapshot(Base):
+    """Perpetual-futures derivatives data per symbol, one row per collection run."""
+
+    __tablename__ = "derivatives_snapshot"
+    __table_args__ = (
+        sa.Index("ix_derivatives_snapshot_symbol_ts", "symbol", "ts"),
+    )
+
+    id: Mapped[int] = mapped_column(sa.Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(sa.String(20), nullable=False)
+    ts: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
+    funding_rate: Mapped[float | None] = mapped_column(sa.Float, nullable=True)
+    open_interest: Mapped[float | None] = mapped_column(sa.Float, nullable=True)
+    long_short_ratio: Mapped[float | None] = mapped_column(sa.Float, nullable=True)
+
+
 # ── market_sentiment ──────────────────────────────────────────────────────────
 
 class MarketSentiment(Base):
