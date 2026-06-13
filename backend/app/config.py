@@ -55,6 +55,35 @@ class Settings(BaseSettings):
     fear_greed_url: str = "https://api.alternative.me/fng/"
     coingecko_api_url: str = "https://api.coingecko.com/api/v3"
 
+    # ── News collector ────────────────────────────────────────────────────────
+    news_collect_interval_minutes: int = 10
+    news_rss_feeds: list[str] = [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+        "https://www.theblock.co/rss.xml",
+        "https://decrypt.co/feed",
+        "https://bitcoinmagazine.com/.rss/full/",
+    ]
+    # Mapping from base ticker to search terms (word-boundary matched in news text).
+    # Multi-word terms like "NEAR Protocol" are matched as full phrases.
+    coin_synonyms: dict[str, list[str]] = {
+        "BTC":   ["Bitcoin",        "BTC"],
+        "ETH":   ["Ethereum",       "ETH",   "Ether"],
+        "SOL":   ["Solana",         "SOL"],
+        "BNB":   ["BNB",            "Binance Coin"],
+        "XRP":   ["XRP",            "Ripple"],
+        "DOGE":  ["Dogecoin",       "DOGE"],
+        "ADA":   ["Cardano",        "ADA"],
+        "AVAX":  ["Avalanche",      "AVAX"],
+        "DOT":   ["Polkadot",       "DOT"],
+        "LINK":  ["Chainlink",      "LINK"],
+        "MATIC": ["Polygon",        "MATIC",  "POL"],
+        "UNI":   ["Uniswap",        "UNI"],
+        "ATOM":  ["Cosmos",         "ATOM"],
+        "LTC":   ["Litecoin",       "LTC"],
+        "NEAR":  ["NEAR Protocol",  "NEAR"],
+    }
+
     # ── Billing — NOWPayments ─────────────────────────────────────────────────
     nowpayments_api_key: str = ""
     nowpayments_ipn_secret: str = ""
