@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.models import NewsItem
+from app.db.models import MarketSentiment, NewsItem
 from app.db.session import AsyncSessionLocal
 
 log = structlog.get_logger(__name__)
@@ -174,11 +174,13 @@ async def fetch_fear_greed(client: httpx.AsyncClient) -> list[dict[str, Any]]:
         # URL is unique per hourly data point → serves as dedup key.
         url   = f"{settings.fear_greed_url}?ts={int(ts.timestamp())}"
         return [{
-            "source":       _FG_SOURCE,
-            "title":        f"Fear & Greed Index: {value} ({label})",
-            "url":          url,
-            "symbols":      [],   # market-wide metric, not coin-specific
-            "published_at": ts,
+            "source":            _FG_SOURCE,
+            "title":             f"Fear & Greed Index: {value} ({label})",
+            "url":               url,
+            "symbols":           [],
+            "published_at":      ts,
+            "fear_greed_value":  value,
+            "classification":    label,
         }]
     except (KeyError, ValueError, IndexError, TypeError) as exc:
         log.error("news_fear_greed_parse_error", error=str(exc))
@@ -221,6 +223,42 @@ async def upsert_news_items(
     return inserted
 
 
+# ── Fear & Greed DB upsert ────────────────────────────────────────────────────
+
+async def upsert_fear_greed(
+    session: AsyncSession,
+    items: list[dict[str, Any]],
+) -> int:
+    """Insert F&G snapshots not already present. Deduplicates by ts. Returns count inserted."""
+    if not items:
+        return 0
+
+    timestamps = [it["published_at"] for it in items]
+    result = await session.execute(
+        select(MarketSentiment.ts).where(MarketSentiment.ts.in_(timestamps))
+    )
+    # SQLite returns naive datetimes; normalise to UTC-aware for comparison.
+    seen: set[datetime] = {
+        row[0] if row[0].tzinfo is not None else row[0].replace(tzinfo=UTC)
+        for row in result
+    }
+
+    inserted = 0
+    for it in items:
+        if it["published_at"] in seen:
+            continue
+        session.add(MarketSentiment(
+            ts=it["published_at"],
+            fear_greed_value=it["fear_greed_value"],
+            classification=it["classification"],
+        ))
+        inserted += 1
+
+    if inserted:
+        await session.commit()
+    return inserted
+
+
 # ── Collection job ─────────────────────────────────────────────────────────────
 
 async def collect_news() -> None:
@@ -244,15 +282,16 @@ async def collect_news() -> None:
                 log.error("news_rss_task_exception", error=str(res))
 
         fg_items = await fetch_fear_greed(client)
-        all_items.extend(fg_items)
 
     async with AsyncSessionLocal() as session:
-        inserted = await upsert_news_items(session, all_items)
+        news_inserted = await upsert_news_items(session, all_items)
+        fg_inserted   = await upsert_fear_greed(session, fg_items)
 
     log.info(
         "news_collect_done",
         fetched=len(all_items),
-        inserted=inserted,
+        news_inserted=news_inserted,
+        fg_inserted=fg_inserted,
     )
 
 

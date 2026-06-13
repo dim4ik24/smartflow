@@ -224,6 +224,21 @@ class Payment(Base):
     user: Mapped[User] = relationship(back_populates="payments")
 
 
+# ── market_sentiment ──────────────────────────────────────────────────────────
+
+class MarketSentiment(Base):
+    """One row per hourly Fear & Greed update. Deduped by ts."""
+
+    __tablename__ = "market_sentiment"
+
+    id: Mapped[int] = mapped_column(sa.Integer, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, unique=True, index=True
+    )
+    fear_greed_value: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    classification: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+
+
 # ── news_items ────────────────────────────────────────────────────────────────
 
 class NewsItem(Base):

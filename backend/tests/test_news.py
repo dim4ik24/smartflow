@@ -7,14 +7,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import sqlalchemy as sa
 
 from app.collectors.news import (
     extract_symbols,
     fetch_fear_greed,
     fetch_rss_feed,
+    upsert_fear_greed,
     upsert_news_items,
 )
-from app.db.models import NewsItem
+from app.db.models import MarketSentiment, NewsItem
 
 # ── Test fixtures / helpers ────────────────────────────────────────────────────
 
@@ -300,3 +302,61 @@ async def test_upsert_sentiment_is_null(db_session):
     )).scalar_one()
     assert row.sentiment is None
     assert row.importance is None
+
+
+# ── upsert_fear_greed — MarketSentiment DB tests ──────────────────────────────
+
+_FG_DEFAULT_TS = datetime(2024, 1, 10, 12, tzinfo=UTC)
+
+
+def _fg_item(ts: datetime | None = None, value: int = 42, label: str = "Fear") -> dict:
+    resolved_ts = ts or _FG_DEFAULT_TS
+    return {
+        "source":           "fear_greed",
+        "title":            f"Fear & Greed Index: {value} ({label})",
+        "url":              f"https://api.alternative.me/fng/?ts={int(resolved_ts.timestamp())}",
+        "symbols":          [],
+        "published_at":     resolved_ts,
+        "fear_greed_value": value,
+        "classification":   label,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fg_upsert_inserts_new_row(db_session):
+    from sqlalchemy import select as sa_select
+
+    ts = datetime(2024, 3, 1, 12, tzinfo=UTC)
+    n = await upsert_fear_greed(db_session, [_fg_item(ts=ts, value=55, label="Greed")])
+    assert n == 1
+    row = (await db_session.execute(
+        sa_select(MarketSentiment).where(MarketSentiment.ts == ts)
+    )).scalar_one()
+    assert row.fear_greed_value == 55
+    assert row.classification == "Greed"
+
+
+@pytest.mark.asyncio
+async def test_fg_upsert_deduplicates_same_ts(db_session):
+    ts = datetime(2024, 3, 2, 12, tzinfo=UTC)
+    n1 = await upsert_fear_greed(db_session, [_fg_item(ts=ts)])
+    n2 = await upsert_fear_greed(db_session, [_fg_item(ts=ts)])
+    assert n1 == 1
+    assert n2 == 0
+
+
+@pytest.mark.asyncio
+async def test_fg_upsert_empty_returns_zero(db_session):
+    assert await upsert_fear_greed(db_session, []) == 0
+
+
+@pytest.mark.asyncio
+async def test_fg_not_written_to_news_items(db_session):
+    from sqlalchemy import select as sa_select
+
+    ts = datetime(2024, 3, 3, 12, tzinfo=UTC)
+    await upsert_fear_greed(db_session, [_fg_item(ts=ts)])
+    count = (await db_session.execute(
+        sa_select(sa.func.count()).select_from(NewsItem).where(NewsItem.source == "fear_greed")
+    )).scalar_one()
+    assert count == 0
