@@ -51,9 +51,9 @@ class Settings(BaseSettings):
     # ── AI ────────────────────────────────────────────────────────────────────
     gemini_api_key: str = ""
 
-    # ── Data sources ──────────────────────────────────────────────────────────
-    cryptopanic_api_key: str = ""
+    # ── Data sources (no API keys required) ──────────────────────────────────
     fear_greed_url: str = "https://api.alternative.me/fng/"
+    coingecko_api_url: str = "https://api.coingecko.com/api/v3"
 
     # ── Billing — NOWPayments ─────────────────────────────────────────────────
     nowpayments_api_key: str = ""

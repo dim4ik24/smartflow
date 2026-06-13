@@ -29,7 +29,7 @@ smartflow/
 │   │   ├── collectors/
 │   │   │   ├── market_ws.py   # WebSocket OHLCV з біржі
 │   │   │   ├── derivatives.py # funding, OI, liquidations (REST, кожні 5 хв)
-│   │   │   └── news.py        # CryptoPanic + RSS + Fear&Greed + макрокалендар
+│   │   │   └── news.py        # RSS + Fear&Greed + CoinGecko + макрокалендар
 │   │   ├── analysis/
 │   │   │   ├── smc.py         # обгортка над smartmoneyconcepts
 │   │   │   ├── indicators.py  # pandas-ta
@@ -95,9 +95,10 @@ news_items   (id PK, source, title, url, symbols JSON,
   REST backfill. 15-20 пар, таймфрейми 15m / 1h / 4h.
 - Деривативи (Binance/Bybit Futures REST, кожні 5 хв): funding rate,
   open interest, long/short ratio; кластери ліквідацій.
-- Новини: CryptoPanic API (фільтр по монетах), RSS (CoinDesk,
-  Cointelegraph, The Block) через feedparser, Fear & Greed
-  (api.alternative.me/fng/), економкалендар (FOMC/CPI).
+- Новини (без API-ключів): RSS через feedparser — CoinDesk, Cointelegraph,
+  The Block, Decrypt, Bitcoin Magazine; Fear & Greed (api.alternative.me/fng/);
+  CoinGecko free tier — trending coins, BTC dominance; економкалендар
+  (FOMC/CPI). Сентимент усіх джерел — через Gemini API.
 - Gemini API: (а) сентимент новини -10..+10 + важливість 1..5, JSON-only
   відповідь; (б) пояснення сигналу — ТІЛЬКИ на основі переданого JSON
   факторів, без вигадок, 4-6 речень, структура: що сталося → чому сетап →

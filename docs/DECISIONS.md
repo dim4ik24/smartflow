@@ -4,6 +4,25 @@
 ## YYYY-MM-DD — Назва рішення
 Контекст → Рішення → Чому → Альтернативи, які відкинули
 
+## 2026-06-13 — Відмова від CryptoPanic; заміна на безкоштовні джерела новин
+
+- **Контекст:** CryptoPanic прибрав безкоштовний tier — тепер від $199/міс.
+  Для проєкту на ранньому етапі це неприйнятна вартість, тим більше що
+  сентимент новин усе одно обробляється через Gemini API: самі заголовки і
+  тексти є лише вхідними даними для нього.
+- **Рішення:** CryptoPanic повністю видалено. Заміна на три безкоштовних
+  джерела без реєстрації: (1) RSS через feedparser — CoinDesk, Cointelegraph,
+  The Block, Decrypt, Bitcoin Magazine; (2) Fear & Greed Index
+  (api.alternative.me/fng/); (3) CoinGecko free tier — trending coins і BTC
+  dominance через публічний REST. `CRYPTOPANIC_API_KEY` видалено з
+  config.py та .env.example; натомість додано `COINGECKO_API_URL`.
+- **Чому:** покриття крипто-новин RSS-стрічками не гірше ніж CryptoPanic для
+  мети сентимент-аналізу; Fear & Greed і CoinGecko дають ринковий контекст
+  без жодних ключів. Усі три джерела вже були частково у специфікації.
+- **Відкинуті альтернативи:** NewsAPI free tier — занадто загальний, вимагає
+  ключа; LunarCrush — платний; залишити CryptoPanic — $2 388/рік на старті
+  продукту без підтвердженого product-market fit.
+
 ## 2026-06-13 — Lookahead bias у smartmoneyconcepts; confirmed_only=True за замовчуванням
 
 - **Контекст:** `swing_highs_lows(swing_length=N)` підтверджує swing-точку в

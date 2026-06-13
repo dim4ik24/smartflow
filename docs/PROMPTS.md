@@ -74,10 +74,12 @@ Lightweight Charts поверх реальної історії з БД. (Вид
 ## Етап 4 — Новини
 
 4.1
-app/collectors/news.py: CryptoPanic API (ключ з .env) + RSS (CoinDesk,
-Cointelegraph, The Block) через feedparser + Fear & Greed
-(api.alternative.me/fng/). Кожні 10 хв, дедуплікація по url, мапінг
-новина→symbols за тикерами/назвами монет. Запис у news_items.
+app/collectors/news.py: RSS через feedparser (CoinDesk, Cointelegraph,
+The Block, Decrypt, Bitcoin Magazine) + Fear & Greed
+(api.alternative.me/fng/) + CoinGecko free tier (trending coins, BTC
+dominance — GET /coins/markets, /global). API-ключі не потрібні.
+Кожні 10 хв, дедуплікація по url, мапінг новина→symbols за
+тикерами/назвами монет. Запис у news_items.
 
 4.2 [PLAN]
 app/analysis/sentiment.py: виклик Gemini API для нових news_items —
