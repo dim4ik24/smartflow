@@ -13,6 +13,7 @@ from app.collectors.news import (
     extract_symbols,
     fetch_fear_greed,
     fetch_rss_feed,
+    get_latest_fear_greed,
     upsert_fear_greed,
     upsert_news_items,
 )
@@ -360,3 +361,19 @@ async def test_fg_not_written_to_news_items(db_session):
         sa_select(sa.func.count()).select_from(NewsItem).where(NewsItem.source == "fear_greed")
     )).scalar_one()
     assert count == 0
+
+
+# ── get_latest_fear_greed ──────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_latest_fear_greed_returns_most_recent(db_session):
+    # Use far-future timestamps to guarantee these rows are the newest in the shared DB.
+    ts_old = datetime(2099, 1, 1, 10, tzinfo=UTC)
+    ts_new = datetime(2099, 1, 1, 11, tzinfo=UTC)
+    await upsert_fear_greed(db_session, [_fg_item(ts=ts_old, value=30, label="Fear")])
+    await upsert_fear_greed(db_session, [_fg_item(ts=ts_new, value=75, label="Greed")])
+
+    row = await get_latest_fear_greed(db_session)
+    assert row is not None
+    assert row.fear_greed_value == 75
+    assert row.classification == "Greed"

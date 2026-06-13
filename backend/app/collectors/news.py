@@ -259,6 +259,18 @@ async def upsert_fear_greed(
     return inserted
 
 
+async def get_latest_fear_greed(
+    session: AsyncSession,
+) -> MarketSentiment | None:
+    """Return the most recent Fear & Greed snapshot, or None if table is empty."""
+    result = await session.execute(
+        select(MarketSentiment)
+        .order_by(MarketSentiment.ts.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 # ── Collection job ─────────────────────────────────────────────────────────────
 
 async def collect_news() -> None:
