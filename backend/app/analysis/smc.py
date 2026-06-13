@@ -249,6 +249,7 @@ def analyze(
     swing_length: int = 10,
     liquidity_range_pct: float = 0.002,
     include_mitigated: bool = False,
+    confirmed_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Run SMC analysis on an OHLCV DataFrame and return a unified zone list.
 
@@ -265,6 +266,24 @@ def analyze(
         (e.g. ``0.002`` = 0.2 %).
     include_mitigated:
         When *False* (default) only active/unmitigated zones are returned.
+    confirmed_only:
+        When *True* (live / real-time mode), swing points in the last
+        ``swing_length`` rows of the swing table are zeroed out before zone
+        detection.
+
+        **Why this matters — lookahead bias.**
+        ``swing_highs_lows(swing_length=N)`` confirms a swing at position *i*
+        by checking that no candle within *i ± N* exceeds it.  For positions
+        near the end of the dataset, those future candles simply do not exist
+        yet, so the library treats the dataset edge as confirmation.  A zone
+        built on such a "swing" (e.g. a CHOCH or OB) would be invisible to a
+        trader at the time the anchor candle actually closed — it is only
+        detectable *N candles later*.
+
+        Setting ``confirmed_only=True`` eliminates this by treating the last
+        ``swing_length`` positions as unconfirmed regardless of what the
+        library returns for them.  Use *False* (default) for backtests where
+        the full historical window is available.
 
     Returns
     -------
@@ -281,6 +300,11 @@ def analyze(
     ohlc = _normalize_columns(ohlc)
     _validate(ohlc)
     shl = _smc.swing_highs_lows(ohlc, swing_length=swing_length)
+    if confirmed_only:
+        # Zero HighLow for the last swing_length rows so no zone extraction
+        # function treats those positions as confirmed swing points.
+        shl = shl.copy()
+        shl.iloc[-swing_length:, shl.columns.get_loc("HighLow")] = 0
     zones: list[dict[str, Any]] = []
     zones.extend(_extract_bos_choch(ohlc, shl))
     zones.extend(_extract_ob(ohlc, shl, include_mitigated))

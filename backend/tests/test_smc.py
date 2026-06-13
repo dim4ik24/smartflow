@@ -284,3 +284,84 @@ def test_analyze_orm_and_standard_same_result() -> None:
     )
     for std, orm in zip(zones_std, zones_orm, strict=True):
         assert std == orm, f"Zone mismatch:\n  standard: {std}\n  orm:      {orm}"
+
+
+# ── confirmed_only (lookahead bias guard) ─────────────────────────────────────
+
+
+def _zone_keys(zones: list[dict]) -> set[tuple]:
+    """Stable identity key for a zone: (type, time_from, price_from rounded)."""
+    return {
+        (z["type"], z["time_from"], round(z["price_from"], 4))
+        for z in zones
+        if z["type"] not in ("PREM", "DISC")  # PREM/DISC time_from reflects run-time, not event
+    }
+
+
+def test_confirmed_only_is_subset_of_raw() -> None:
+    """confirmed_only=True can only remove zones, never add new ones."""
+    df = _make_trending(n=80, seed=42)
+    raw = analyze(df, swing_length=5, include_mitigated=True, confirmed_only=False)
+    confirmed = analyze(df, swing_length=5, include_mitigated=True, confirmed_only=True)
+    assert _zone_keys(confirmed).issubset(_zone_keys(raw))
+    assert len(confirmed) <= len(raw)
+
+
+def test_confirmed_only_removes_choch_from_edge_swing() -> None:
+    """Concrete lookahead proof.
+
+    With n=80, seed=42, swing_length=5 the library marks position 79
+    (the very last bar) as a swing LOW.  Confirming a swing at the last bar
+    requires 5 future candles that do not exist yet — this is lookahead bias.
+    That swing creates a CHOCH zone.
+
+    confirmed_only=True zeros shl positions 75-79 so the unconfirmed swing
+    at 79 is ignored.  The CHOCH must disappear from the result.
+    """
+    df = _make_trending(n=80, seed=42)
+    swing_length = 5
+
+    raw = analyze(df, swing_length=swing_length, include_mitigated=True, confirmed_only=False)
+    confirmed = analyze(df, swing_length=swing_length, include_mitigated=True, confirmed_only=True)
+
+    raw_choch = [z for z in raw if z["type"] == "CHOCH"]
+    conf_choch = [z for z in confirmed if z["type"] == "CHOCH"]
+
+    assert raw_choch, (
+        "Expected at least one CHOCH in unfiltered analysis for n=80, seed=42, swing_length=5"
+    )
+    assert len(conf_choch) < len(raw_choch), (
+        f"confirmed_only=True must reduce CHOCH count "
+        f"(raw={len(raw_choch)}, confirmed={len(conf_choch)})"
+    )
+
+
+def test_confirmed_only_stable_on_extension() -> None:
+    """Stability invariant: zones confirmed on D must persist when D is extended.
+
+    If a zone from confirmed_only=True on D[0..N] disappeared after analysing
+    D[0..N+swing_length], it must have depended on the tail of D as implicit
+    future candles — i.e. it was still biased.
+
+    We slice both datasets from the same base series so the first N candles
+    are byte-for-byte identical.
+    """
+    swing_length = 5
+    n_short = 80
+
+    df_base = _make_trending(n=n_short + swing_length, seed=42)
+    df_short = df_base.iloc[:n_short]
+    df_long = df_base  # full n_short + swing_length candles
+
+    keys_short = _zone_keys(
+        analyze(df_short, swing_length=swing_length, include_mitigated=True, confirmed_only=True)
+    )
+    keys_long = _zone_keys(
+        analyze(df_long, swing_length=swing_length, include_mitigated=True, confirmed_only=True)
+    )
+
+    assert keys_short.issubset(keys_long), (
+        "Confirmed zones from shorter dataset disappeared after extension — "
+        "they still depended on future candles.\n"
+        f"Missing after extension: {keys_short - keys_long}"
+    )
