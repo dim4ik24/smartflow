@@ -50,6 +50,9 @@ class Settings(BaseSettings):
 
     # ── AI ────────────────────────────────────────────────────────────────────
     gemini_api_key: str = ""
+    gemini_model: str = "gemini-1.5-flash"
+    sentiment_batch_size: int = 20
+    sentiment_analyze_interval_minutes: int = 10
 
     # ── Data sources (no API keys required) ──────────────────────────────────
     fear_greed_url: str = "https://api.alternative.me/fng/"
