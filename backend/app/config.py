@@ -50,7 +50,7 @@ class Settings(BaseSettings):
 
     # ── AI ────────────────────────────────────────────────────────────────────
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-1.5-flash"
+    gemini_model: str = "gemini-2.0-flash"
     sentiment_batch_size: int = 20
     sentiment_analyze_interval_minutes: int = 10
 

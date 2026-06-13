@@ -1,22 +1,27 @@
 """News sentiment analysis via Google Gemini API (Etap 4.2).
 
-Fetches NewsItem rows where sentiment IS NULL, scores them in batches via
-Gemini generateContent, and writes sentiment (-10..+10) and importance (1..5)
-back to the DB.
+Uses the current google-genai SDK (``from google import genai``), NOT the
+deprecated google-generativeai package.
 
-Disabled automatically when GEMINI_API_KEY is empty — the rest of the pipeline
-continues without sentiment data.
+Structured output (response_mime_type="application/json" + response_schema)
+constrains Gemini to emit a valid JSON array — no markdown fences possible
+at the protocol level.  A manual fallback parser (_strip_fences +
+_parse_gemini_response) is kept anyway because structured output occasionally
+still misbehaves in edge cases.
+
+Disabled automatically when GEMINI_API_KEY is empty.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import re
-from typing import Any
 
-import httpx
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,19 +31,21 @@ from app.db.session import AsyncSessionLocal
 
 log = structlog.get_logger(__name__)
 
-_GEMINI_ENDPOINT = (
-    "https://generativelanguage.googleapis.com/v1beta/models"
-    "/{model}:generateContent"
-)
 _MAX_RETRIES  = 5
 _BACKOFF_BASE = 2.0
-_HTTP_TIMEOUT = 30.0
 
-# Matches ```json...``` or ```...``` blocks.
+# Fallback: strip ```json...``` / ```...``` wrappers the model might emit.
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```")
 
 
-# ── Pure helpers ───────────────────────────────────────────────────────────────
+# ── Structured-output schema ───────────────────────────────────────────────────
+
+class _SentimentScore(BaseModel):
+    sentiment: int    # -10..+10
+    importance: int   # 1..5
+
+
+# ── Pure helpers (fallback parsing) ───────────────────────────────────────────
 
 def _strip_fences(text: str) -> str:
     """Remove ```json...``` wrappers; trim to outermost [ ... ] if present."""
@@ -56,10 +63,9 @@ def _parse_gemini_response(
     text: str,
     expected: int,
 ) -> list[dict[str, int]] | None:
-    """Parse and validate a Gemini JSON response for *expected* items.
+    """Parse and validate JSON text for *expected* items.
 
-    Returns None (and logs a warning) on any structural or parse failure —
-    callers keep sentiment=NULL for the affected batch.
+    Returns None on any failure — callers keep sentiment=NULL for the batch.
     """
     try:
         data = json.loads(_strip_fences(text))
@@ -86,12 +92,10 @@ def _parse_gemini_response(
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("sentiment_item_invalid_fields", index=i, error=str(exc))
             return None
-        # Clamp to valid ranges — Gemini occasionally overshoots by 1.
         validated.append({
             "sentiment":  max(-10, min(10, s)),
             "importance": max(1,   min(5,  imp)),
         })
-
     return validated
 
 
@@ -101,7 +105,7 @@ def _build_prompt(titles: list[str]) -> str:
         "You are a crypto market sentiment analyst.\n"
         f"Analyze the following {len(titles)} crypto news headlines.\n"
         "Return a JSON array with exactly one object per headline, in the same order.\n"
-        'Each object must have exactly two integer keys:\n'
+        "Each object must have exactly two integer keys:\n"
         '  "sentiment": -10 (very bearish) to +10 (very bullish), 0 = neutral\n'
         '  "importance": 1 (minor noise) to 5 (major market event)\n'
         "Return ONLY the JSON array. No explanations, no markdown, no extra text.\n\n"
@@ -109,70 +113,49 @@ def _build_prompt(titles: list[str]) -> str:
     )
 
 
-# ── Gemini HTTP call with retry ────────────────────────────────────────────────
+# ── Gemini SDK call with retry ─────────────────────────────────────────────────
 
 async def _call_gemini(
-    client: httpx.AsyncClient,
+    client: genai.Client,
     prompt: str,
     *,
-    api_key: str,
     model: str,
 ) -> str | None:
-    """POST to Gemini generateContent. Returns extracted text or None after all retries."""
-    url     = _GEMINI_ENDPOINT.format(model=model)
-    payload: dict[str, Any] = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json"},
-    }
+    """Call Gemini via async SDK. Returns response text or None after all retries.
+
+    Retryable: 429 (rate limit), 5xx (server error), network/timeout exceptions.
+    Non-retryable: 4xx (except 429) — wrong key, bad request, etc.
+    """
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=list[_SentimentScore],
+    )
 
     for attempt in range(_MAX_RETRIES):
         try:
-            resp = await client.post(
-                url,
-                json=payload,
-                params={"key": api_key},
-                timeout=_HTTP_TIMEOUT,
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
             )
+            return response.text
 
-            if resp.status_code == 429:
-                delay = _BACKOFF_BASE ** attempt
-                log.warning(
-                    "sentiment_rate_limit",
-                    attempt=attempt, next_delay_s=delay,
-                )
-                if attempt < _MAX_RETRIES - 1:
-                    await asyncio.sleep(delay)
-                continue
+        except Exception as exc:
+            # Extract HTTP status code if the SDK attaches one.
+            code: int | None = getattr(exc, "code", None)
 
-            if resp.status_code >= 500:
-                delay = _BACKOFF_BASE ** attempt
-                log.warning(
-                    "sentiment_server_error",
-                    status=resp.status_code, attempt=attempt, next_delay_s=delay,
-                )
-                if attempt < _MAX_RETRIES - 1:
-                    await asyncio.sleep(delay)
-                continue
+            # Non-retryable: definite API error that is NOT rate-limit or server fault.
+            if code is not None and code != 429 and code < 500:
+                log.error("sentiment_api_fatal", code=code, error=str(exc))
+                return None
 
-            resp.raise_for_status()  # raises HTTPStatusError for remaining 4xx
-            data = resp.json()
-            return str(data["candidates"][0]["content"]["parts"][0]["text"])
-
-        except httpx.HTTPStatusError as exc:
-            # Non-retryable 4xx (e.g. 400 bad request, 401 invalid key).
-            log.error("sentiment_http_error", status=exc.response.status_code, error=str(exc))
-            return None
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
             delay = _BACKOFF_BASE ** attempt
             log.warning(
-                "sentiment_network_error",
-                attempt=attempt, error=str(exc), next_delay_s=delay,
+                "sentiment_retry",
+                code=code, attempt=attempt, error=str(exc), next_delay_s=delay,
             )
             if attempt < _MAX_RETRIES - 1:
                 await asyncio.sleep(delay)
-        except (KeyError, IndexError, TypeError) as exc:
-            log.error("sentiment_response_structure_error", error=str(exc))
-            return None
 
     log.error("sentiment_call_failed", attempts=_MAX_RETRIES)
     return None
@@ -181,19 +164,18 @@ async def _call_gemini(
 # ── Batch analysis ─────────────────────────────────────────────────────────────
 
 async def analyze_batch(
-    client: httpx.AsyncClient,
+    client: genai.Client,
     items: list[NewsItem],
     *,
-    api_key: str,
     model: str,
 ) -> list[tuple[int, int | None, int | None]]:
-    """Analyze one batch. Returns [(news_item_id, sentiment, importance), ...].
+    """Analyze one batch of NewsItem rows.
 
-    sentiment/importance are None when Gemini call or parsing fails — the
-    caller leaves those DB rows with sentiment=NULL.
+    Returns [(news_item_id, sentiment, importance), ...].
+    sentiment/importance are None when the Gemini call or parsing fails.
     """
     prompt = _build_prompt([it.title for it in items])
-    raw    = await _call_gemini(client, prompt, api_key=api_key, model=model)
+    raw    = await _call_gemini(client, prompt, model=model)
 
     if raw is None:
         return [(it.id, None, None) for it in items]
@@ -260,15 +242,15 @@ async def run_sentiment_analysis() -> None:
         return
 
     log.info("sentiment_analysis_start", total=len(items), batch_size=batch_size)
-    api_key = settings.gemini_api_key
-    model   = settings.gemini_model
+
+    client = genai.Client(api_key=settings.gemini_api_key)
+    model  = settings.gemini_model
     all_results: list[tuple[int, int | None, int | None]] = []
 
-    async with httpx.AsyncClient() as client:
-        for i in range(0, len(items), batch_size):
-            batch   = items[i : i + batch_size]
-            results = await analyze_batch(client, batch, api_key=api_key, model=model)
-            all_results.extend(results)
+    for i in range(0, len(items), batch_size):
+        batch   = items[i : i + batch_size]
+        results = await analyze_batch(client, batch, model=model)
+        all_results.extend(results)
 
     async with AsyncSessionLocal() as session:
         updated = await _write_results(session, all_results)
