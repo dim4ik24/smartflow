@@ -53,7 +53,6 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.0-flash"
     sentiment_batch_size: int = 20
     sentiment_analyze_interval_minutes: int = 10
-    derivatives_collect_interval_minutes: int = 5
 
     # ── Data sources (no API keys required) ──────────────────────────────────
     fear_greed_url: str = "https://api.alternative.me/fng/"
@@ -121,6 +120,21 @@ class Settings(BaseSettings):
     watched_timeframes: list[str] = ["15m", "1h", "4h"]
     collector_heartbeat_timeout: int = 30   # seconds; reconnect if no data
     collector_backfill_limit: int = 500     # candles per REST fetch on gap-fill
+    derivatives_collect_interval_minutes: int = 5
+
+    # ── Scoring weights (SPEC §6; calibrated by backtest) ─────────────────────
+    score_weight_sweep: int = 25
+    score_weight_ob_retest: int = 20
+    score_weight_fvg: int = 10
+    score_weight_structure: int = 15
+    score_weight_funding: int = 10
+    score_weight_oi: int = 5
+    score_weight_sentiment: int = 10
+    score_weight_premium_discount: int = 5
+    score_min_rr: float = 2.0
+    score_funding_extreme_threshold: float = 0.0001   # |funding| ≥ this = extreme
+    score_sentiment_threshold: float = 1.0            # |avg_sentiment| ≥ this = agrees
+    analysis_candle_limit: int = 200
 
     @field_validator("master_encryption_key")
     @classmethod
