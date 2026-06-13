@@ -45,6 +45,6 @@ module = [
     "feedparser.*",
     "apscheduler.*",
     "slowapi.*",
-    "google.generativeai.*",
+    "google.genai.*",
 ]
 ignore_missing_imports = true
