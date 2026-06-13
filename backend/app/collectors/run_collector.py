@@ -15,7 +15,7 @@ import sys
 # use ThreadedResolver (getaddrinfo via thread pool) which works on all platforms.
 # This has no effect on Linux production servers where c-ares works correctly.
 if sys.platform == "win32":
-    sys.modules.setdefault("aiodns", None)  # type: ignore[assignment]
+    sys.modules.setdefault("aiodns", None)  # type: ignore[arg-type]
 
 import structlog
 
