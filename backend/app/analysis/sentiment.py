@@ -16,9 +16,19 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sys
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# aiohttp (used internally by google-genai SDK) on Windows tries to use
+# aiodns/pycares for async DNS, but c-ares cannot read the Windows DNS config
+# and raises "Could not contact DNS servers". Disabling aiodns before the
+# import forces aiohttp to fall back to ThreadedResolver (getaddrinfo via
+# thread pool), which works on all platforms. No effect on Linux production.
+if sys.platform == "win32":
+    sys.modules.setdefault("aiodns", None)  # type: ignore[arg-type]
+
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
