@@ -259,3 +259,28 @@ def test_include_mitigated_adds_zones(trending: pd.DataFrame) -> None:
     without = analyze(trending, swing_length=5, include_mitigated=False)
     with_ = analyze(trending, swing_length=5, include_mitigated=True)
     assert len(with_) >= len(without), "include_mitigated=True should not reduce zone count"
+
+
+# ── Column normalization ───────────────────────────────────────────────────────
+
+
+def test_analyze_accepts_orm_columns() -> None:
+    """analyze() must accept ORM short names (o/h/l/c/v) without external rename."""
+    df = _make_trending()
+    orm_df = df.rename(columns={"open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"})
+    zones = analyze(orm_df, swing_length=5, include_mitigated=True)
+    assert isinstance(zones, list)
+    assert len(zones) > 0, "ORM-format DataFrame produced no zones"
+
+
+def test_analyze_orm_and_standard_same_result() -> None:
+    """ORM-format and standard-format DataFrames must produce identical zones."""
+    df = _make_trending()
+    orm_df = df.rename(columns={"open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"})
+    zones_std = analyze(df, swing_length=5, include_mitigated=True)
+    zones_orm = analyze(orm_df, swing_length=5, include_mitigated=True)
+    assert len(zones_std) == len(zones_orm), (
+        f"Zone count differs: standard={len(zones_std)}, orm={len(zones_orm)}"
+    )
+    for std, orm in zip(zones_std, zones_orm, strict=True):
+        assert std == orm, f"Zone mismatch:\n  standard: {std}\n  orm:      {orm}"

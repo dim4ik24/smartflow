@@ -41,6 +41,10 @@ ZONE_TYPES = frozenset(
 )
 _REQUIRED_COLS = frozenset({"open", "high", "low", "close", "volume"})
 _MIN_CANDLES = 10
+# ORM Candle model uses single-letter column names; normalize them on entry.
+_ORM_COL_MAP: dict[str, str] = {
+    "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -56,6 +60,13 @@ def _pos_to_ts(ohlc: pd.DataFrame, pos: Any) -> str | None:
         return None
     i = int(pos)
     return _fmt(ohlc.index[i]) if 0 <= i < len(ohlc) else None
+
+
+def _normalize_columns(ohlc: pd.DataFrame) -> pd.DataFrame:
+    """Rename ORM short names (o/h/l/c/v) to standard names if present."""
+    if _ORM_COL_MAP.keys() & set(ohlc.columns):
+        return ohlc.rename(columns=_ORM_COL_MAP)
+    return ohlc
 
 
 def _validate(ohlc: pd.DataFrame) -> None:
@@ -244,8 +255,9 @@ def analyze(
     Parameters
     ----------
     ohlc:
-        DataFrame with DatetimeIndex (UTC) and columns
-        ``open, high, low, close, volume``.
+        DataFrame with DatetimeIndex (UTC) and either standard columns
+        ``open, high, low, close, volume`` or ORM short names
+        ``o, h, l, c, v`` (normalized automatically).
     swing_length:
         Candles to look back/forward for swing point detection (5–20 typical).
     liquidity_range_pct:
@@ -266,6 +278,7 @@ def analyze(
     TypeError
         If the DataFrame index is not a DatetimeIndex.
     """
+    ohlc = _normalize_columns(ohlc)
     _validate(ohlc)
     shl = _smc.swing_highs_lows(ohlc, swing_length=swing_length)
     zones: list[dict[str, Any]] = []
