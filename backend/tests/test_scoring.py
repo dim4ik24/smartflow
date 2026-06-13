@@ -25,7 +25,8 @@ def _settings(**overrides: object) -> Settings:
         "score_weight_fvg": 10,
         "score_weight_structure": 15,
         "score_weight_funding": 10,
-        "score_weight_oi": 5,
+        "score_weight_oi_rising": 3,
+        "score_weight_lsr": 2,
         "score_weight_sentiment": 10,
         "score_weight_premium_discount": 5,
         "score_min_rr": 2.0,
@@ -219,7 +220,8 @@ class TestApplyWeights:
     def test_all_flags_give_100(self) -> None:
         s = _settings()
         keys = ("sweep", "ob_retest", "fvg", "structure_aligned",
-                "funding_extreme", "oi_confirms", "sentiment_agrees", "premium_discount")
+                "funding_extreme", "oi_rising", "lsr_confirms",
+                "sentiment_agrees", "premium_discount")
         f = dict.fromkeys(keys, True)
         assert _apply_weights(f, s) == 100
 
@@ -287,8 +289,9 @@ class TestScoreSetup:
         assert result is None
 
     def test_all_factors_maximum_score(self) -> None:
-        # All 8 factors fire → score = 100
+        # All 9 factors fire → score = 100
         der = _derivatives(funding_rate=-0.001, long_short_ratio=1.5, open_interest=1e6)
+        prev_der = _derivatives(open_interest=0.9e6)   # lower than current → ΔOI > 0
         result = score_setup(
             symbol="BTC/USDT", side="long", current_price=100.0,
             zones_entry=[
@@ -301,6 +304,7 @@ class TestScoreSetup:
             zones_ctx=[_bos("long")],           # 4h structure agrees
             atr=1.0,
             derivatives=der,
+            prev_derivatives=prev_der,
             avg_sentiment=3.0,                  # positive → sentiment_agrees for long
             s=_settings(),
         )
@@ -370,18 +374,52 @@ class TestScoreSetup:
         ob_zones = [z for z in result.zones if z["type"] == "OB"]
         assert len(ob_zones) == 1
 
-    def test_oi_confirms_long_when_lsr_ge_1(self) -> None:
+    def test_lsr_confirms_long_when_lsr_ge_1(self) -> None:
         der = _derivatives(long_short_ratio=1.2)
         result = score_setup(
             **self._base_long_setup(), derivatives=der, avg_sentiment=None, s=_settings()
         )
         assert result is not None
-        assert result.factors["oi_confirms"] is True
+        assert result.factors["lsr_confirms"] is True
 
-    def test_oi_does_not_confirm_long_when_lsr_lt_1(self) -> None:
+    def test_lsr_does_not_confirm_long_when_lsr_lt_1(self) -> None:
         der = _derivatives(long_short_ratio=0.8)
         result = score_setup(
             **self._base_long_setup(), derivatives=der, avg_sentiment=None, s=_settings()
         )
         assert result is not None
-        assert result.factors["oi_confirms"] is False
+        assert result.factors["lsr_confirms"] is False
+
+    def test_oi_rising_when_oi_increases(self) -> None:
+        der = _derivatives(open_interest=1_100_000.0)
+        prev_der = _derivatives(open_interest=1_000_000.0)
+        result = score_setup(
+            **self._base_long_setup(),
+            derivatives=der, prev_derivatives=prev_der,
+            avg_sentiment=None, s=_settings(),
+        )
+        assert result is not None
+        assert result.factors["oi_rising"] is True
+        assert result.factors["delta_oi"] == pytest.approx(100_000.0)
+
+    def test_oi_not_rising_when_oi_decreases(self) -> None:
+        der = _derivatives(open_interest=900_000.0)
+        prev_der = _derivatives(open_interest=1_000_000.0)
+        result = score_setup(
+            **self._base_long_setup(),
+            derivatives=der, prev_derivatives=prev_der,
+            avg_sentiment=None, s=_settings(),
+        )
+        assert result is not None
+        assert result.factors["oi_rising"] is False
+
+    def test_oi_not_rising_when_no_prev(self) -> None:
+        der = _derivatives(open_interest=1_000_000.0)
+        result = score_setup(
+            **self._base_long_setup(),
+            derivatives=der, prev_derivatives=None,
+            avg_sentiment=None, s=_settings(),
+        )
+        assert result is not None
+        assert result.factors["oi_rising"] is False
+        assert result.factors["delta_oi"] is None

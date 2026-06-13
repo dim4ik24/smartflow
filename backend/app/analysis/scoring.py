@@ -183,6 +183,7 @@ def _compute_factors(
     zones_entry: list[dict[str, Any]],
     zones_ctx: list[dict[str, Any]],
     derivatives: DerivativesSnapshot | None,
+    prev_derivatives: DerivativesSnapshot | None,
     avg_sentiment: float | None,
     s: Settings,
 ) -> dict[str, Any]:
@@ -200,26 +201,35 @@ def _compute_factors(
     structure_aligned = (dir_4h == side) and (dir_1h == side)
 
     # Derivatives factors.
-    funding_rate: float | None  = None
+    funding_rate: float | None = None
     long_short_ratio: float | None = None
     open_interest: float | None = None
+    delta_oi: float | None = None
     funding_extreme = False
-    oi_confirms     = False
+    oi_rising = False
+    lsr_confirms = False
 
     if derivatives is not None:
-        funding_rate     = derivatives.funding_rate
+        funding_rate = derivatives.funding_rate
         long_short_ratio = derivatives.long_short_ratio
-        open_interest    = derivatives.open_interest
+        open_interest = derivatives.open_interest
 
         if funding_rate is not None:
             thr = s.score_funding_extreme_threshold
             if side == "long" and funding_rate <= -thr or side == "short" and funding_rate >= thr:
                 funding_extreme = True
 
+        # ΔOI: rising open interest means more contracts are opening → conviction.
+        if (open_interest is not None
+                and prev_derivatives is not None
+                and prev_derivatives.open_interest is not None):
+            delta_oi = open_interest - prev_derivatives.open_interest
+            oi_rising = delta_oi > 0
+
+        # Long/short ratio: crowd positioning confirms or contradicts the side.
         if long_short_ratio is not None:
-            # Rising LSR confirms long bias; falling LSR confirms short bias.
-            oi_confirms = (
-                (side == "long"  and long_short_ratio >= 1.0) or
+            lsr_confirms = (
+                (side == "long" and long_short_ratio >= 1.0) or
                 (side == "short" and long_short_ratio < 1.0)
             )
 
@@ -227,7 +237,7 @@ def _compute_factors(
     if avg_sentiment is not None:
         thr = s.score_sentiment_threshold
         sentiment_agrees = (
-            (side == "long"  and avg_sentiment >=  thr) or
+            (side == "long" and avg_sentiment >= thr) or
             (side == "short" and avg_sentiment <= -thr)
         )
 
@@ -235,13 +245,15 @@ def _compute_factors(
 
     return {
         "sweep":             has_sweep,
-        "ob_retest":         True,          # having an entry OB IS the retest
+        "ob_retest":         True,           # having an entry OB IS the retest
         "fvg":               has_fvg,
         "structure_aligned": structure_aligned,
         "funding_extreme":   funding_extreme,
         "funding_rate":      funding_rate,
-        "oi_confirms":       oi_confirms,
+        "oi_rising":         oi_rising,
         "open_interest":     open_interest,
+        "delta_oi":          delta_oi,
+        "lsr_confirms":      lsr_confirms,
         "long_short_ratio":  long_short_ratio,
         "sentiment_agrees":  sentiment_agrees,
         "avg_sentiment":     avg_sentiment,
@@ -262,8 +274,10 @@ def _apply_weights(factors: dict[str, Any], s: Settings) -> int:
         score += s.score_weight_structure
     if factors.get("funding_extreme"):
         score += s.score_weight_funding
-    if factors.get("oi_confirms"):
-        score += s.score_weight_oi
+    if factors.get("oi_rising"):
+        score += s.score_weight_oi_rising
+    if factors.get("lsr_confirms"):
+        score += s.score_weight_lsr
     if factors.get("sentiment_agrees"):
         score += s.score_weight_sentiment
     if factors.get("premium_discount"):
@@ -282,6 +296,7 @@ def score_setup(
     zones_ctx: list[dict[str, Any]],
     atr: float,
     derivatives: DerivativesSnapshot | None,
+    prev_derivatives: DerivativesSnapshot | None = None,
     avg_sentiment: float | None,
     s: Settings | None = None,
 ) -> ScoreResult | None:
@@ -303,6 +318,8 @@ def score_setup(
         Average True Range of the entry timeframe — used for SL placement.
     derivatives:
         Latest DerivativesSnapshot for this symbol, or None.
+    prev_derivatives:
+        Second-latest snapshot for ΔOI computation; None on cold start.
     avg_sentiment:
         Importance-weighted average news sentiment (−10..+10), or None.
     s:
@@ -332,6 +349,7 @@ def score_setup(
         zones_entry=zones_entry,
         zones_ctx=zones_ctx,
         derivatives=derivatives,
+        prev_derivatives=prev_derivatives,
         avg_sentiment=avg_sentiment,
         s=s,
     )

@@ -128,7 +128,8 @@ class Settings(BaseSettings):
     score_weight_fvg: int = 10
     score_weight_structure: int = 15
     score_weight_funding: int = 10
-    score_weight_oi: int = 5
+    score_weight_oi_rising: int = 3   # ΔOI > 0: open interest grew → conviction
+    score_weight_lsr: int = 2         # long/short ratio confirms direction
     score_weight_sentiment: int = 10
     score_weight_premium_discount: int = 5
     score_min_rr: float = 2.0

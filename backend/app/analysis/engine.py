@@ -13,6 +13,7 @@ so that the returned Signal already has an assigned ID.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pandas as pd
@@ -22,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analysis import indicators, smc
 from app.analysis.scoring import detect_structure_direction, score_setup
-from app.collectors.derivatives import get_latest_derivatives
+from app.collectors.derivatives import get_latest_derivatives, get_prev_derivatives
 from app.config import settings
 from app.db.models import Candle, MarketSentiment, NewsItem, Signal
 from app.db.session import AsyncSessionLocal
@@ -112,7 +113,10 @@ async def analyze_symbol_on_close(
         return None
 
     # 4. Supporting data ───────────────────────────────────────────────────────
-    derivatives = await get_latest_derivatives(symbol, session)
+    derivatives, prev_derivatives = await asyncio.gather(
+        get_latest_derivatives(symbol, session),
+        get_prev_derivatives(symbol, session),
+    )
 
     cutoff = datetime.now(UTC) - timedelta(hours=4)
     news_result = await session.execute(
@@ -153,6 +157,7 @@ async def analyze_symbol_on_close(
         zones_ctx=zones_ctx,
         atr=current_atr,
         derivatives=derivatives,
+        prev_derivatives=prev_derivatives,
         avg_sentiment=avg_sent,
     )
     if result is None:

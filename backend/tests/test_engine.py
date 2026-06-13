@@ -96,6 +96,8 @@ class TestAnalyzeSymbolOnClose:
             patch("app.analysis.engine.score_setup", return_value=low_score),
             patch("app.analysis.engine.get_latest_derivatives",
                   new_callable=AsyncMock, return_value=None),
+            patch("app.analysis.engine.get_prev_derivatives",
+                  new_callable=AsyncMock, return_value=None),
         ):
             result = await analyze_symbol_on_close("BTC/USDT", "1h", db_session)
         assert result is None
@@ -109,6 +111,8 @@ class TestAnalyzeSymbolOnClose:
             patch("app.analysis.engine.score_setup", return_value=None),  # no valid OB / RR
             patch("app.analysis.engine.get_latest_derivatives",
                   new_callable=AsyncMock, return_value=None),
+            patch("app.analysis.engine.get_prev_derivatives",
+                  new_callable=AsyncMock, return_value=None),
         ):
             result = await analyze_symbol_on_close("ETH/USDT", "1h", db_session)
         assert result is None
@@ -121,6 +125,8 @@ class TestAnalyzeSymbolOnClose:
             patch("app.analysis.engine.smc.analyze", return_value=[_BOS_LONG]),
             patch("app.analysis.engine.score_setup", return_value=_SCORE_RESULT),
             patch("app.analysis.engine.get_latest_derivatives",
+                  new_callable=AsyncMock, return_value=None),
+            patch("app.analysis.engine.get_prev_derivatives",
                   new_callable=AsyncMock, return_value=None),
         ):
             signal = await analyze_symbol_on_close("SOL/USDT", "1h", db_session)
@@ -141,6 +147,8 @@ class TestAnalyzeSymbolOnClose:
             patch("app.analysis.engine.smc.analyze", return_value=[_BOS_LONG]),
             patch("app.analysis.engine.score_setup", return_value=_SCORE_RESULT),
             patch("app.analysis.engine.get_latest_derivatives",
+                  new_callable=AsyncMock, return_value=None),
+            patch("app.analysis.engine.get_prev_derivatives",
                   new_callable=AsyncMock, return_value=None),
         ):
             signal = await analyze_symbol_on_close("BNB/USDT", "1h", db_session)

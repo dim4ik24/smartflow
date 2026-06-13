@@ -157,6 +157,24 @@ async def get_latest_derivatives(
     return result.scalar_one_or_none()
 
 
+async def get_prev_derivatives(
+    symbol: str,
+    session: AsyncSession,
+) -> DerivativesSnapshot | None:
+    """Return the second-latest snapshot for *symbol*, used to compute ΔOI.
+
+    Returns None when fewer than two snapshots exist (cold start / early run).
+    """
+    result = await session.execute(
+        select(DerivativesSnapshot)
+        .where(DerivativesSnapshot.symbol == symbol)
+        .order_by(DerivativesSnapshot.ts.desc())
+        .limit(2)
+    )
+    rows = result.scalars().all()
+    return rows[1] if len(rows) >= 2 else None
+
+
 # ── Exchange factory ──────────────────────────────────────────────────────────
 
 def _build_exchange(s: Settings) -> ccxt_async.Exchange:
