@@ -249,7 +249,7 @@ def analyze(
     swing_length: int = 10,
     liquidity_range_pct: float = 0.002,
     include_mitigated: bool = False,
-    confirmed_only: bool = False,
+    confirmed_only: bool = True,
 ) -> list[dict[str, Any]]:
     """Run SMC analysis on an OHLCV DataFrame and return a unified zone list.
 
@@ -280,10 +280,12 @@ def analyze(
         trader at the time the anchor candle actually closed — it is only
         detectable *N candles later*.
 
-        Setting ``confirmed_only=True`` eliminates this by treating the last
-        ``swing_length`` positions as unconfirmed regardless of what the
-        library returns for them.  Use *False* (default) for backtests where
-        the full historical window is available.
+        Setting ``confirmed_only=True`` (the default) eliminates this by
+        treating the last ``swing_length`` positions as unconfirmed regardless
+        of what the library returns for them — a fail-safe: it is always safer
+        to miss a zone than to act on a phantom one.  Pass *False* explicitly
+        for backtests where the full historical window is available and every
+        closed candle's future is known.
 
     Returns
     -------
