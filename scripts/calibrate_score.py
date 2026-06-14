@@ -68,14 +68,13 @@ MIN_NEEDED = {        # trigger backfill if below this
 }
 SCORE_BUCKETS = [(0, 20), (20, 35), (35, 50), (50, 70), (70, 101)]
 FACTOR_KEYS = [
-    "sweep", "ob_retest", "fvg", "structure_aligned",
+    "sweep", "ob_retest", "structure_aligned",
     "funding_extreme", "oi_rising", "lsr_confirms",
     "sentiment_agrees", "premium_discount",
 ]
 FACTOR_WEIGHTS = {
     "sweep":             settings.score_weight_sweep,
     "ob_retest":         settings.score_weight_ob_retest,
-    "fvg":               settings.score_weight_fvg,
     "structure_aligned": settings.score_weight_structure,
     "funding_extreme":   settings.score_weight_funding,
     "oi_rising":         settings.score_weight_oi_rising,
@@ -256,13 +255,6 @@ def _scan(
             long_short_ratio=None,  # LSR history not pre-fetched (weight=2, minor)
         )
 
-        # FVG recency cutoff: only FVGs from the last N candles count.
-        recency_n = settings.score_fvg_recency_candles
-        fvg_recency_cutoff: str | None = (
-            win_entry.index[-recency_n].strftime("%Y-%m-%dT%H:%M:%SZ")
-            if len(win_entry) >= recency_n else None
-        )
-
         result = score_setup(
             symbol=symbol,
             side=side,
@@ -273,7 +265,6 @@ def _scan(
             derivatives=hist_deriv,
             prev_derivatives=None,
             avg_sentiment=None,
-            fvg_recency_cutoff=fvg_recency_cutoff,
         )
 
         if result is None:

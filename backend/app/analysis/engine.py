@@ -236,14 +236,6 @@ async def analyze_symbol_on_close(
     # 8. Score ────────────────────────────────────────────────────────────────
     current_price = float(entry_df["close"].iloc[-1])
 
-    # Compute FVG recency cutoff: only FVGs from the last N candles are "fresh".
-    # Uses the same ISO format as zone time_from fields ("%Y-%m-%dT%H:%M:%SZ").
-    recency_n = settings.score_fvg_recency_candles
-    fvg_recency_cutoff: str | None = (
-        entry_df.index[-recency_n].strftime("%Y-%m-%dT%H:%M:%SZ")
-        if len(entry_df) >= recency_n else None
-    )
-
     result = score_setup(
         symbol=symbol,
         side=side,
@@ -254,7 +246,6 @@ async def analyze_symbol_on_close(
         derivatives=derivatives,
         prev_derivatives=prev_derivatives,
         avg_sentiment=avg_sent,
-        fvg_recency_cutoff=fvg_recency_cutoff,
     )
     if result is None:
         log.debug("engine_no_valid_setup", symbol=symbol, side=side)

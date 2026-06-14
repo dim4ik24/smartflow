@@ -123,14 +123,16 @@ class Settings(BaseSettings):
     derivatives_collect_interval_minutes: int = 5
 
     # ── Scoring weights (SPEC §6; calibrated by backtest) ─────────────────────
-    score_weight_sweep: int = 25
+    # 8 active factors; weights sum to 100.
+    # FVG removed (see DECISIONS.md 2026-06-14): structurally incompatible with
+    # OB-retest entries — its 10 pts redistributed to sweep (+5) and structure (+5).
+    score_weight_sweep: int = 30
     score_weight_ob_retest: int = 20
-    score_weight_fvg: int = 10
-    score_weight_structure: int = 15
+    score_weight_structure: int = 20
     score_weight_funding: int = 10
+    score_weight_sentiment: int = 10
     score_weight_oi_rising: int = 3   # ΔOI > 0: open interest grew → conviction
     score_weight_lsr: int = 2         # long/short ratio confirms direction
-    score_weight_sentiment: int = 10
     score_weight_premium_discount: int = 5
     score_min_rr: float = 2.0
     score_funding_extreme_threshold: float = 0.00005  # |funding| ≥ this = extreme
@@ -142,14 +144,6 @@ class Settings(BaseSettings):
     # If the mid-entry is further than this the market hasn't reached the zone yet
     # ("setup not ripe") and the candidate is discarded.
     score_max_entry_atr_distance: float = 3.0
-    # Maximum distance (in ATR units) from current price for a FVG to be counted
-    # as "confirming" the setup.  The FVG's price range must overlap the band
-    # [current_price ± score_fvg_max_atr_distance × ATR].
-    score_fvg_max_atr_distance: float = 3.0
-    # Only FVGs formed within the last N candles are considered recent enough to
-    # be relevant.  In a 200-candle rolling window almost all FVGs are already
-    # mitigated, so stale ones add noise rather than signal.
-    score_fvg_recency_candles: int = 25
     analysis_candle_limit: int = 200
 
     @field_validator("master_encryption_key")

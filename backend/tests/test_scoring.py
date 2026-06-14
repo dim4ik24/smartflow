@@ -22,10 +22,9 @@ from app.config import Settings
 def _settings(**overrides: object) -> Settings:
     """Return a Settings-like object with test defaults and optional overrides."""
     defaults: dict[str, object] = {
-        "score_weight_sweep": 25,
+        "score_weight_sweep": 30,
         "score_weight_ob_retest": 20,
-        "score_weight_fvg": 10,
-        "score_weight_structure": 15,
+        "score_weight_structure": 20,
         "score_weight_funding": 10,
         "score_weight_oi_rising": 3,
         "score_weight_lsr": 2,
@@ -41,8 +40,6 @@ def _settings(**overrides: object) -> Settings:
         # Test OBs have mid at OB mid ≈ price=100 → distance ≈ 0; keep the default loose
         # so existing tests are not affected by the distance guard.
         "score_max_entry_atr_distance": 3.0,
-        # FVG proximity: match the production default.
-        "score_fvg_max_atr_distance": 3.0,
     }
     defaults.update(overrides)
     s = MagicMock(spec=Settings)
@@ -414,8 +411,10 @@ class TestBuildEntryGeometry:
 
 class TestApplyWeights:
     def test_all_flags_give_100(self) -> None:
+        # 8 active factors: sweep(30)+ob_retest(20)+structure(20)+funding(10)+
+        # oi_rising(3)+lsr(2)+sentiment(10)+premium_discount(5) = 100
         s = _settings()
-        keys = ("sweep", "ob_retest", "fvg", "structure_aligned",
+        keys = ("sweep", "ob_retest", "structure_aligned",
                 "funding_extreme", "oi_rising", "lsr_confirms",
                 "sentiment_agrees", "premium_discount")
         f = dict.fromkeys(keys, True)
@@ -428,11 +427,8 @@ class TestApplyWeights:
 
     def test_capped_at_100_even_if_overweight(self) -> None:
         # If weights sum > 100 due to misconfiguration, we still cap.
-        s = _settings(
-            score_weight_sweep=50, score_weight_ob_retest=50,
-            score_weight_fvg=50,
-        )
-        f = {"sweep": True, "ob_retest": True, "fvg": True}
+        s = _settings(score_weight_sweep=50, score_weight_ob_retest=50)
+        f = {"sweep": True, "ob_retest": True}
         assert _apply_weights(f, s) == 100
 
     def test_no_flags_zero(self) -> None:
@@ -485,7 +481,9 @@ class TestScoreSetup:
         assert result is None
 
     def test_all_factors_maximum_score(self) -> None:
-        # All 9 factors fire → score = 100
+        # All 8 active factors fire → score = 100
+        # sweep(30)+ob_retest(20)+structure(20)+funding(10)+oi_rising(3)+lsr(2)+
+        # sentiment(10)+premium_discount(5) = 100
         der = _derivatives(funding_rate=-0.001, long_short_ratio=1.5, open_interest=1e6)
         prev_der = _derivatives(open_interest=0.9e6)   # lower than current → ΔOI > 0
         result = score_setup(
@@ -493,7 +491,6 @@ class TestScoreSetup:
             zones_entry=[
                 _ob("long", 99.0, 101.0),
                 _sweep("long"),
-                _fvg("long", 99.5, 100.5),
                 _bos("long"),                   # 1h structure
                 _disc(95.0, 102.0),             # price (100) inside discount zone
             ],
@@ -560,7 +557,7 @@ class TestScoreSetup:
         )
         assert result is not None
         assert result.factors["structure_aligned"] is True
-        assert result.score >= 20 + 15   # ob_retest + structure
+        assert result.score >= 20 + 20   # ob_retest(20) + structure(20)
 
     def test_result_contains_entry_ob_in_zones(self) -> None:
         result = score_setup(
@@ -678,36 +675,6 @@ class TestScoreSetup:
             s=_settings(score_max_ob_width_pct=0.10, score_max_entry_atr_distance=3.0),
         )
         assert result is None
-
-    def test_fvg_excluded_by_recency_cutoff(self) -> None:
-        # FVG is in ATR-band but older than cutoff → fvg factor must NOT fire
-        old_fvg = {**_fvg("long", 99.5, 100.5), "time_from": "2026-01-01T00:00:00Z"}
-        result = score_setup(
-            symbol="BTC/USDT", side="long", current_price=100.0,
-            zones_entry=[_ob("long", 99.0, 101.0), old_fvg, _bos("long")],
-            zones_ctx=[_bos("long")],
-            atr=1.0, derivatives=None, avg_sentiment=None,
-            fvg_recency_cutoff="2026-02-01T00:00:00Z",   # after the FVG time_from
-            s=_settings(),
-        )
-        assert result is not None
-        assert result.factors["fvg"] is False
-        assert result.score == 20 + 15   # ob_retest + structure_aligned, no fvg
-
-    def test_fvg_within_recency_fires(self) -> None:
-        # Fresh FVG (after cutoff) in ATR-band → fvg factor fires
-        fresh_fvg = {**_fvg("long", 99.5, 100.5), "time_from": "2026-06-01T00:00:00Z"}
-        result = score_setup(
-            symbol="BTC/USDT", side="long", current_price=100.0,
-            zones_entry=[_ob("long", 99.0, 101.0), fresh_fvg, _bos("long")],
-            zones_ctx=[_bos("long")],
-            atr=1.0, derivatives=None, avg_sentiment=None,
-            fvg_recency_cutoff="2026-05-01T00:00:00Z",   # FVG is after this
-            s=_settings(),
-        )
-        assert result is not None
-        assert result.factors["fvg"] is True
-        assert result.score == 20 + 10 + 15   # ob_retest + fvg + structure_aligned
 
     def test_distance_guard_close_ob_produces_valid_result(self) -> None:
         """score_setup returns a result when OB is within 3 ATR of current price."""

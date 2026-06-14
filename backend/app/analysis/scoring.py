@@ -95,18 +95,19 @@ def _has_nearby_fvg(
     max_atr_distance: float,
     recency_cutoff: str | None = None,
 ) -> bool:
-    """True if a *recent* active FVG in trade direction lies near current_price.
+    """True if an active FVG in trade direction lies near current_price.
 
-    Three conditions must all hold for a FVG to count:
-    1. **Unmitigated** — already-filled FVGs are noise, not signal.
-    2. **Directional** — must match the trade side (bearish for short, bullish for long).
-    3. **Nearby** — the FVG's price range overlaps
+    Reserved for future FVG-entry setup type (Etap 11+).  Not used in the current
+    OB-retest scoring pipeline — FVG is structurally incompatible with OB-retest
+    entries (price fills FVGs en route to the OB).  See DECISIONS.md 2026-06-14.
+
+    Conditions:
+    1. **Unmitigated** — already-filled FVGs are noise.
+    2. **Directional** — must match the trade side.
+    3. **Nearby** — price range overlaps
        ``[current_price - max_atr_distance*atr, current_price + max_atr_distance*atr]``.
-    4. **Recent** (optional) — if *recency_cutoff* is provided (ISO-8601 string,
-       same format as zone ``time_from`` fields), only FVGs formed at or after that
-       timestamp are considered.  In a 200-candle rolling window almost every FVG
-       is already mitigated; only fresh FVGs from the last N candles carry signal.
-       When *recency_cutoff* is ``None`` no time filter is applied.
+    4. **Recent** (optional) — if *recency_cutoff* (ISO-8601) is given, only FVGs
+       at or after that timestamp are considered.
     """
     band_lo = current_price - max_atr_distance * atr
     band_hi = current_price + max_atr_distance * atr
@@ -224,18 +225,11 @@ def _compute_factors(
     derivatives: DerivativesSnapshot | None,
     prev_derivatives: DerivativesSnapshot | None,
     avg_sentiment: float | None,
-    fvg_recency_cutoff: str | None = None,
     s: Settings,
 ) -> dict[str, Any]:
     all_zones = zones_entry + zones_ctx
 
     has_sweep = _has_sweep(all_zones, side)
-
-    has_fvg = _has_nearby_fvg(
-        all_zones, side, current_price, atr,
-        s.score_fvg_max_atr_distance,
-        recency_cutoff=fvg_recency_cutoff,
-    )
 
     # Both 4h and 1h structural direction must agree with the intended side.
     dir_4h = detect_structure_direction(zones_ctx)
@@ -288,7 +282,6 @@ def _compute_factors(
     return {
         "sweep":             has_sweep,
         "ob_retest":         True,           # having an entry OB IS the retest
-        "fvg":               has_fvg,
         "structure_aligned": structure_aligned,
         "funding_extreme":   funding_extreme,
         "funding_rate":      funding_rate,
@@ -310,8 +303,6 @@ def _apply_weights(factors: dict[str, Any], s: Settings) -> int:
         score += s.score_weight_sweep
     if factors.get("ob_retest"):
         score += s.score_weight_ob_retest
-    if factors.get("fvg"):
-        score += s.score_weight_fvg
     if factors.get("structure_aligned"):
         score += s.score_weight_structure
     if factors.get("funding_extreme"):
@@ -340,7 +331,6 @@ def score_setup(
     derivatives: DerivativesSnapshot | None,
     prev_derivatives: DerivativesSnapshot | None = None,
     avg_sentiment: float | None,
-    fvg_recency_cutoff: str | None = None,
     s: Settings | None = None,
 ) -> ScoreResult | None:
     """Score a potential setup and build the signal geometry.
@@ -399,7 +389,6 @@ def score_setup(
         derivatives=derivatives,
         prev_derivatives=prev_derivatives,
         avg_sentiment=avg_sentiment,
-        fvg_recency_cutoff=fvg_recency_cutoff,
         s=s,
     )
     score = _apply_weights(factors, s)
