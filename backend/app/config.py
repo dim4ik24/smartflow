@@ -133,7 +133,7 @@ class Settings(BaseSettings):
     score_weight_sentiment: int = 10
     score_weight_premium_discount: int = 5
     score_min_rr: float = 2.0
-    score_funding_extreme_threshold: float = 0.0001   # |funding| ≥ this = extreme
+    score_funding_extreme_threshold: float = 0.00005  # |funding| ≥ this = extreme
     score_sentiment_threshold: float = 1.0            # |avg_sentiment| ≥ this = agrees
     # Maximum OB width as a fraction of current price (e.g. 0.015 = 1.5 %).
     # Wider zones are swing-range library artifacts, not single-candle order blocks.
@@ -146,6 +146,10 @@ class Settings(BaseSettings):
     # as "confirming" the setup.  The FVG's price range must overlap the band
     # [current_price ± score_fvg_max_atr_distance × ATR].
     score_fvg_max_atr_distance: float = 3.0
+    # Only FVGs formed within the last N candles are considered recent enough to
+    # be relevant.  In a 200-candle rolling window almost all FVGs are already
+    # mitigated, so stale ones add noise rather than signal.
+    score_fvg_recency_candles: int = 25
     analysis_candle_limit: int = 200
 
     @field_validator("master_encryption_key")
