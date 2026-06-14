@@ -135,6 +135,9 @@ class Settings(BaseSettings):
     score_min_rr: float = 2.0
     score_funding_extreme_threshold: float = 0.0001   # |funding| ≥ this = extreme
     score_sentiment_threshold: float = 1.0            # |avg_sentiment| ≥ this = agrees
+    # Maximum OB width as a fraction of current price (e.g. 0.015 = 1.5 %).
+    # Wider zones are swing-range library artifacts, not single-candle order blocks.
+    score_max_ob_width_pct: float = 0.015
     analysis_candle_limit: int = 200
 
     @field_validator("master_encryption_key")

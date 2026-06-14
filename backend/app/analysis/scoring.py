@@ -52,13 +52,25 @@ def _find_entry_ob(
     side: str,
     price: float,
     atr: float,
+    max_ob_width_pct: float = 0.015,
 ) -> dict[str, Any] | None:
-    """Find the strongest active OB near current price that matches trade side."""
+    """Find the strongest active OB near current price that matches trade side.
+
+    The *max_ob_width_pct* guard rejects zones that span more than the given
+    fraction of price (default 1.5 %).  The ``smartmoneyconcepts`` library
+    occasionally emits OBs whose ``Top`` equals a distant swing-high and
+    ``Bottom`` equals a swing-low — producing a zone that is many ATRs wide.
+    Those zones are not tradeable single-candle order blocks and must be
+    filtered before the geometry builder uses their price_from/price_to as the
+    entry range, which would yield a nonsensical mid-entry point far from the
+    current market price.
+    """
     candidates = [
         z for z in zones
         if z["type"] == "OB"
         and z["direction"] == side
         and not z.get("mitigated", False)
+        and (z["price_to"] - z["price_from"]) / price <= max_ob_width_pct
         and z["price_from"] - atr <= price <= z["price_to"] + atr
     ]
     if not candidates:
@@ -333,7 +345,7 @@ def score_setup(
     if s is None:
         s = _settings
 
-    entry_ob = _find_entry_ob(zones_entry, side, current_price, atr)
+    entry_ob = _find_entry_ob(zones_entry, side, current_price, atr, s.score_max_ob_width_pct)
     if entry_ob is None:
         return None
 

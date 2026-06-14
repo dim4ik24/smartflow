@@ -8,6 +8,7 @@ import pytest
 from app.analysis.scoring import (
     _apply_weights,
     _build_entry_geometry,
+    _find_entry_ob,
     _has_sweep,
     _in_premium_or_discount,
     detect_structure_direction,
@@ -32,6 +33,10 @@ def _settings(**overrides: object) -> Settings:
         "score_min_rr": 2.0,
         "score_funding_extreme_threshold": 0.0001,
         "score_sentiment_threshold": 1.0,
+        # Test OBs use price=100 and width=2 (2 %) — use 0.03 so existing tests pass.
+        # Production default is 0.015 (1.5 %); override with score_max_ob_width_pct=0.015
+        # in tests that specifically verify the width filter.
+        "score_max_ob_width_pct": 0.03,
     }
     defaults.update(overrides)
     s = MagicMock(spec=Settings)
@@ -161,6 +166,63 @@ class TestHasSweep:
 
     def test_no_sweep_zones(self) -> None:
         assert _has_sweep([_ob("long", 99, 101)], "long") is False
+
+
+# ── _find_entry_ob ────────────────────────────────────────────────────────────
+
+class TestFindEntryOb:
+    def test_narrow_ob_selected(self) -> None:
+        # OB width = 1.0 pts at price 100 → 1.0 % < 1.5 % → passes
+        ob = _ob("long", 99.5, 100.5)
+        result = _find_entry_ob([ob], "long", 100.0, 1.0, max_ob_width_pct=0.015)
+        assert result is ob
+
+    def test_ob_at_exact_limit_passes(self) -> None:
+        # OB width = 1.5 pts at price 100 → 1.5 % == 1.5 % → passes (<=)
+        ob = _ob("long", 99.25, 100.75)
+        result = _find_entry_ob([ob], "long", 100.0, 1.0, max_ob_width_pct=0.015)
+        assert result is ob
+
+    def test_ob_exceeds_width_rejected(self) -> None:
+        # OB width = 2.0 pts at price 100 → 2.0 % > 1.5 % → filtered out
+        ob = _ob("long", 99.0, 101.0)
+        result = _find_entry_ob([ob], "long", 100.0, 1.0, max_ob_width_pct=0.015)
+        assert result is None
+
+    def test_eth_bug_reproduction(self) -> None:
+        # ETH 15m live bug: library OB spanning 1667–1829 (9.65 % of price 1678)
+        wide_ob = _ob("short", 1667.41, 1829.42)
+        result = _find_entry_ob([wide_ob], "short", 1678.42, 1.5077, max_ob_width_pct=0.015)
+        assert result is None
+
+    def test_eth_narrow_ob_passes_when_in_range(self) -> None:
+        # Narrow bearish OB (0.52 %) near current price — should be selected
+        ob = _ob("short", 1664.51, 1673.16)
+        result = _find_entry_ob([ob], "short", 1670.0, 1.5077, max_ob_width_pct=0.015)
+        assert result is ob
+
+    def test_mitigated_ob_always_rejected(self) -> None:
+        ob = {**_ob("long", 99.5, 100.5), "mitigated": True}
+        result = _find_entry_ob([ob], "long", 100.0, 1.0, max_ob_width_pct=0.015)
+        assert result is None
+
+    def test_wrong_direction_rejected(self) -> None:
+        ob = _ob("short", 99.5, 100.5)
+        result = _find_entry_ob([ob], "long", 100.0, 1.0, max_ob_width_pct=0.015)
+        assert result is None
+
+    def test_selects_highest_strength_among_valid(self) -> None:
+        weak = _ob("long", 99.5, 100.5, strength=0.3)
+        strong = _ob("long", 99.6, 100.4, strength=0.9)
+        result = _find_entry_ob([weak, strong], "long", 100.0, 1.0, max_ob_width_pct=0.015)
+        assert result is strong
+
+    def test_wide_ob_skipped_narrow_ob_selected(self) -> None:
+        # Both OBs match direction and proximity; only the narrow one passes the width guard.
+        wide   = _ob("long", 90.0, 110.0, strength=0.9)  # 20 % wide → rejected
+        narrow = _ob("long", 99.5, 100.5, strength=0.5)  # 1 % wide  → selected
+        result = _find_entry_ob([wide, narrow], "long", 100.0, 1.0, max_ob_width_pct=0.015)
+        assert result is narrow
 
 
 # ── _in_premium_or_discount ───────────────────────────────────────────────────
@@ -423,3 +485,31 @@ class TestScoreSetup:
         assert result is not None
         assert result.factors["oi_rising"] is False
         assert result.factors["delta_oi"] is None
+
+    def test_wide_ob_rejected_by_width_guard(self) -> None:
+        """ETH 15m bug: 9.65 %-wide OB (library swing-range artifact) must be rejected."""
+        # Reproduces the live bug where ETH SHORT signal had entry 1667–1829 (162 pts, 9.65 %).
+        wide_ob = _ob("short", 1667.41, 1829.42)
+        result = score_setup(
+            symbol="ETH/USDT", side="short", current_price=1678.42,
+            zones_entry=[wide_ob],
+            zones_ctx=[_bos("short")],
+            atr=1.5077,
+            derivatives=None, avg_sentiment=None,
+            s=_settings(score_max_ob_width_pct=0.015),
+        )
+        assert result is None
+
+    def test_narrow_ob_at_production_threshold_passes(self) -> None:
+        """An OB at exactly 1.5 % width passes the production guard."""
+        # At price 1000, 1.5 % = 15 pts; OB width = 15 → passes (<=)
+        narrow_ob = _ob("long", 992.5, 1007.5)
+        result = score_setup(
+            symbol="ETH/USDT", side="long", current_price=1000.0,
+            zones_entry=[narrow_ob],
+            zones_ctx=[_bos("long")],
+            atr=5.0,
+            derivatives=None, avg_sentiment=None,
+            s=_settings(score_max_ob_width_pct=0.015),
+        )
+        assert result is not None
