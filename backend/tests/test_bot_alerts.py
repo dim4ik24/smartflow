@@ -325,3 +325,91 @@ async def test_send_alert_keyboard_has_mini_app_url(db_session: AsyncSession) ->
     url: str = keyboard.inline_keyboard[0][0].url or ""
     assert "t.me" in url
     assert "7" in url
+
+
+# ── Zone time-bounded rendering (fill_between) ────────────────────────────────
+
+def test_render_chart_zone_with_time_from_renders() -> None:
+    """Zone with time_from is rendered from that timestamp onward (no crash)."""
+    zones = [
+        {
+            "type": "OB",
+            "price_from": 29500.0,
+            "price_to": 30000.0,
+            "time_from": "2024-01-01T05:00:00+00:00",  # mid-chart start
+        }
+    ]
+    result = render_signal_chart(_make_signal(zones=zones), _make_candles(n=20))
+    assert result[:4] == _PNG_MAGIC
+
+
+def test_render_chart_zone_with_invalid_time_from_falls_back() -> None:
+    """Invalid time_from falls back to chart left edge without crashing."""
+    zones = [
+        {
+            "type": "FVG",
+            "price_from": 30100.0,
+            "price_to": 30300.0,
+            "time_from": "not-a-valid-timestamp",
+        }
+    ]
+    result = render_signal_chart(_make_signal(zones=zones), _make_candles(n=20))
+    assert result[:4] == _PNG_MAGIC
+
+
+def test_render_chart_zone_with_missing_time_from_falls_back() -> None:
+    """Zone without time_from key defaults to chart left edge."""
+    zones = [{"type": "OB", "price_from": 29500.0, "price_to": 30000.0}]  # no time_from
+    result = render_signal_chart(_make_signal(zones=zones), _make_candles(n=20))
+    assert result[:4] == _PNG_MAGIC
+
+
+def test_render_chart_liq_sweep_zone_renders() -> None:
+    """LIQ_SWEEP zone type uses the purple colour without crashing."""
+    zones = [{"type": "LIQ_SWEEP", "price_from": 29800.0, "price_to": 30200.0}]
+    result = render_signal_chart(_make_signal(zones=zones), _make_candles(n=20))
+    assert result[:4] == _PNG_MAGIC
+
+
+def test_render_chart_zone_skipped_when_price_lo_zero() -> None:
+    """Zone with price_from=0 is silently skipped."""
+    zones = [{"type": "OB", "price_from": 0.0, "price_to": 30000.0}]
+    result = render_signal_chart(_make_signal(zones=zones), _make_candles(n=20))
+    assert result[:4] == _PNG_MAGIC
+
+
+def test_render_chart_zone_skipped_when_price_hi_le_lo() -> None:
+    """Zone with price_to <= price_from is silently skipped."""
+    zones = [{"type": "OB", "price_from": 30000.0, "price_to": 29500.0}]
+    result = render_signal_chart(_make_signal(zones=zones), _make_candles(n=20))
+    assert result[:4] == _PNG_MAGIC
+
+
+def test_render_chart_time_from_before_chart_start_uses_full_mask() -> None:
+    """Zone time_from before chart start → full mask from index[0]."""
+    df = _make_candles(n=20)
+    zones = [
+        {
+            "type": "OB",
+            "price_from": 29500.0,
+            "price_to": 30000.0,
+            "time_from": "2023-01-01T00:00:00+00:00",  # well before chart start
+        }
+    ]
+    result = render_signal_chart(_make_signal(zones=zones), df)
+    assert result[:4] == _PNG_MAGIC
+
+
+def test_render_chart_time_from_after_chart_end_skips_zone() -> None:
+    """Zone time_from after the last candle produces an empty mask — zone is skipped."""
+    df = _make_candles(n=20)
+    zones = [
+        {
+            "type": "FVG",
+            "price_from": 30100.0,
+            "price_to": 30300.0,
+            "time_from": "2030-01-01T00:00:00+00:00",  # far future
+        }
+    ]
+    result = render_signal_chart(_make_signal(zones=zones), df)
+    assert result[:4] == _PNG_MAGIC

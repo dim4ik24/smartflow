@@ -148,14 +148,42 @@ def render_signal_chart(signal: Signal, candles_df: pd.DataFrame) -> bytes:
     )
     price_ax = axes[0]
 
-    # ── Zone bands ────────────────────────────────────────────────────────────
+    # ── Zone bands (time-bounded rectangles) ─────────────────────────────────
+    # Each zone is drawn from its formation time (time_from) to the chart's
+    # right edge — not as a full-width axhspan across the entire chart.
     for zone in (signal.zones or []):
         ztype = str(zone.get("type", ""))
         color, alpha = _ZONE_COLORS.get(ztype, _ZONE_COLOR_DEFAULT)
         p_lo = float(zone.get("price_from") or 0.0)
         p_hi = float(zone.get("price_to") or 0.0)
-        if p_lo > 0 and p_hi > p_lo:
-            price_ax.axhspan(p_lo, p_hi, alpha=alpha, color=color, zorder=0)
+        if p_lo <= 0 or p_hi <= p_lo:
+            continue
+
+        # Determine zone start time; fall back to chart left edge if missing.
+        time_from_raw = zone.get("time_from")
+        try:
+            zone_ts = pd.Timestamp(time_from_raw)
+            if zone_ts.tzinfo is None:
+                zone_ts = zone_ts.tz_localize("UTC")
+            else:
+                zone_ts = zone_ts.tz_convert("UTC")
+            effective_start = zone_ts if zone_ts > df.index[0] else df.index[0]
+        except Exception:
+            effective_start = df.index[0]
+
+        mask = df.index >= effective_start
+        if not mask.any():
+            continue
+        price_ax.fill_between(
+            df.index,
+            p_lo,
+            p_hi,
+            where=mask,
+            facecolor=color,
+            alpha=alpha,
+            linewidth=0,
+            zorder=0,
+        )
 
     # ── Key price levels + right-edge labels ──────────────────────────────────
     for attr, color, ls, lw, prefix in _LEVEL_SPECS:

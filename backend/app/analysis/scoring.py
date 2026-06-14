@@ -53,17 +53,25 @@ def _find_entry_ob(
     price: float,
     atr: float,
     max_ob_width_pct: float = 0.015,
+    max_entry_atr_distance: float = 3.0,
 ) -> dict[str, Any] | None:
     """Find the strongest active OB near current price that matches trade side.
 
-    The *max_ob_width_pct* guard rejects zones that span more than the given
-    fraction of price (default 1.5 %).  The ``smartmoneyconcepts`` library
-    occasionally emits OBs whose ``Top`` equals a distant swing-high and
-    ``Bottom`` equals a swing-low — producing a zone that is many ATRs wide.
-    Those zones are not tradeable single-candle order blocks and must be
-    filtered before the geometry builder uses their price_from/price_to as the
-    entry range, which would yield a nonsensical mid-entry point far from the
-    current market price.
+    Two sanity guards are applied to each candidate zone before it is
+    considered:
+
+    1. **Width guard** (*max_ob_width_pct*): rejects zones wider than the
+       given fraction of price (default 1.5 %).  The ``smartmoneyconcepts``
+       library occasionally returns OBs whose Top/Bottom span a full swing
+       range rather than a single candle — those are not tradeable and produce
+       nonsensical mid-entry points.
+
+    2. **Distance guard** (*max_entry_atr_distance*): rejects zones whose
+       mid-point is more than N ATRs away from the current price (default 3).
+       For a SHORT, the OB must be at or near current price (resistance
+       retest), not many ATRs above it.  For a LONG, the OB must be at or
+       near current price (support retest), not many ATRs below it.  If
+       the market hasn't reached the zone yet the setup is "not ripe".
     """
     candidates = [
         z for z in zones
@@ -72,6 +80,7 @@ def _find_entry_ob(
         and not z.get("mitigated", False)
         and (z["price_to"] - z["price_from"]) / price <= max_ob_width_pct
         and z["price_from"] - atr <= price <= z["price_to"] + atr
+        and abs((z["price_from"] + z["price_to"]) / 2.0 - price) <= max_entry_atr_distance * atr
     ]
     if not candidates:
         return None
@@ -345,7 +354,11 @@ def score_setup(
     if s is None:
         s = _settings
 
-    entry_ob = _find_entry_ob(zones_entry, side, current_price, atr, s.score_max_ob_width_pct)
+    entry_ob = _find_entry_ob(
+        zones_entry, side, current_price, atr,
+        s.score_max_ob_width_pct,
+        s.score_max_entry_atr_distance,
+    )
     if entry_ob is None:
         return None
 

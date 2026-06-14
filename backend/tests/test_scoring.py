@@ -37,6 +37,9 @@ def _settings(**overrides: object) -> Settings:
         # Production default is 0.015 (1.5 %); override with score_max_ob_width_pct=0.015
         # in tests that specifically verify the width filter.
         "score_max_ob_width_pct": 0.03,
+        # Test OBs have mid at OB mid ≈ price=100 → distance ≈ 0; keep the default loose
+        # so existing tests are not affected by the distance guard.
+        "score_max_entry_atr_distance": 3.0,
     }
     defaults.update(overrides)
     s = MagicMock(spec=Settings)
@@ -223,6 +226,60 @@ class TestFindEntryOb:
         narrow = _ob("long", 99.5, 100.5, strength=0.5)  # 1 % wide  → selected
         result = _find_entry_ob([wide, narrow], "long", 100.0, 1.0, max_ob_width_pct=0.015)
         assert result is narrow
+
+    # ── Distance guard ────────────────────────────────────────────────────────
+
+    def test_mid_entry_too_far_short_rejected(self) -> None:
+        # SHORT OB [99.5, 107]: proximity passes (99.5-1=98.5<=100, 100<=107+1=108),
+        # but mid=103.25 → distance = 3.25 ATR > 3 → rejected.
+        # Width 7.5 % passes the relaxed 10 % cap so ONLY the distance guard fires.
+        ob = _ob("short", 99.5, 107.0)
+        result = _find_entry_ob(
+            [ob], "short", 100.0, 1.0,
+            max_ob_width_pct=0.10, max_entry_atr_distance=3.0,
+        )
+        assert result is None
+
+    def test_mid_entry_at_distance_boundary_passes(self) -> None:
+        # SHORT OB [100.5, 105.5]: mid=103, distance = 3 ATR = limit → passes (<=).
+        ob = _ob("short", 100.5, 105.5)
+        result = _find_entry_ob(
+            [ob], "short", 100.0, 1.0,
+            max_ob_width_pct=0.10, max_entry_atr_distance=3.0,
+        )
+        assert result is ob
+
+    def test_long_ob_too_far_below_price_rejected(self) -> None:
+        # LONG OB [93, 99]: proximity passes (93-1=92<=100, 100<=99+1=100),
+        # but mid=96 → distance = 4 ATR > 3 → rejected.
+        ob = _ob("long", 93.0, 99.0)   # width=6 pts = 6 %, passes 10 % cap
+        result = _find_entry_ob(
+            [ob], "long", 100.0, 1.0,
+            max_ob_width_pct=0.10, max_entry_atr_distance=3.0,
+        )
+        assert result is None
+
+    def test_long_ob_close_enough_passes(self) -> None:
+        # LONG OB [96, 99]: proximity passes (100<=99+1=100),
+        # mid=97.5 → distance = 2.5 ATR < 3 → passes.
+        ob = _ob("long", 96.0, 99.0)   # width=3 pts = 3 %
+        result = _find_entry_ob(
+            [ob], "long", 100.0, 1.0,
+            max_ob_width_pct=0.10, max_entry_atr_distance=3.0,
+        )
+        assert result is ob
+
+    def test_far_ob_rejected_close_ob_selected_instead(self) -> None:
+        # Both OBs pass width and proximity; the far one (mid=96, 4 ATR from price)
+        # is rejected and the close one (mid=98, 2 ATR) is selected, even though the
+        # far one has higher strength.
+        far_ob   = _ob("long", 93.0, 99.0, strength=0.95)  # mid=96, 4 ATR → rejected
+        close_ob = _ob("long", 97.0, 99.0, strength=0.50)  # mid=98, 2 ATR → selected
+        result = _find_entry_ob(
+            [far_ob, close_ob], "long", 100.0, 1.0,
+            max_ob_width_pct=0.10, max_entry_atr_distance=3.0,
+        )
+        assert result is close_ob
 
 
 # ── _in_premium_or_discount ───────────────────────────────────────────────────
@@ -511,5 +568,50 @@ class TestScoreSetup:
             atr=5.0,
             derivatives=None, avg_sentiment=None,
             s=_settings(score_max_ob_width_pct=0.015),
+        )
+        assert result is not None
+
+    def test_distance_guard_short_ob_too_far_above_returns_none(self) -> None:
+        """score_setup returns None when SHORT OB mid is >3 ATR above current price."""
+        # SHORT OB [101.5, 107.5]: mid=104.5, distance=4.5 ATR > 3 → no setup.
+        # Proximity: 101.5-1=100.5 <=100? NO → also fails proximity, so result=None.
+        # Use OB closer: [100.5, 106.5] → mid=103.5, dist=3.5 ATR > 3 → rejected by distance.
+        far_short_ob = _ob("short", 100.5, 106.5)  # width=6%: passes 10% cap; mid=103.5
+        result = score_setup(
+            symbol="BTC/USDT", side="short", current_price=100.0,
+            zones_entry=[far_short_ob],
+            zones_ctx=[_bos("short")],
+            atr=1.0,
+            derivatives=None, avg_sentiment=None,
+            s=_settings(score_max_ob_width_pct=0.10, score_max_entry_atr_distance=3.0),
+        )
+        assert result is None
+
+    def test_distance_guard_long_ob_too_far_below_returns_none(self) -> None:
+        """score_setup returns None when LONG OB mid is >3 ATR below current price."""
+        # LONG OB [93, 99]: proximity 93-1=92<=100, 100<=99+1=100 ✓
+        # mid=96, distance=4 ATR > 3 → rejected by distance guard.
+        far_long_ob = _ob("long", 93.0, 99.0)  # width=6%: passes 10% cap; mid=96
+        result = score_setup(
+            symbol="BTC/USDT", side="long", current_price=100.0,
+            zones_entry=[far_long_ob],
+            zones_ctx=[_bos("long")],
+            atr=1.0,
+            derivatives=None, avg_sentiment=None,
+            s=_settings(score_max_ob_width_pct=0.10, score_max_entry_atr_distance=3.0),
+        )
+        assert result is None
+
+    def test_distance_guard_close_ob_produces_valid_result(self) -> None:
+        """score_setup returns a result when OB is within 3 ATR of current price."""
+        # SHORT OB [100.5, 103.5]: mid=102, distance=2 ATR < 3 → passes.
+        close_ob = _ob("short", 100.5, 103.5)  # width=3%: passes 10% cap; mid=102
+        result = score_setup(
+            symbol="BTC/USDT", side="short", current_price=100.0,
+            zones_entry=[close_ob],
+            zones_ctx=[_bos("short")],
+            atr=1.0,
+            derivatives=None, avg_sentiment=None,
+            s=_settings(score_max_ob_width_pct=0.10, score_max_entry_atr_distance=3.0),
         )
         assert result is not None

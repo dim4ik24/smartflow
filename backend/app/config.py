@@ -138,6 +138,10 @@ class Settings(BaseSettings):
     # Maximum OB width as a fraction of current price (e.g. 0.015 = 1.5 %).
     # Wider zones are swing-range library artifacts, not single-candle order blocks.
     score_max_ob_width_pct: float = 0.015
+    # Maximum distance from current price to OB mid-point, expressed in ATR units.
+    # If the mid-entry is further than this the market hasn't reached the zone yet
+    # ("setup not ripe") and the candidate is discarded.
+    score_max_entry_atr_distance: float = 3.0
     analysis_candle_limit: int = 200
 
     @field_validator("master_encryption_key")
