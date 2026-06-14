@@ -4,6 +4,20 @@ Fetches perpetual-futures metrics from Bybit/Binance via ccxt REST every
 ``derivatives_collect_interval_minutes`` minutes and inserts one
 DerivativesSnapshot row per symbol. All fetch errors are logged and silenced;
 the scheduler job never crashes.
+
+Bybit specifics (verified against V5 API)
+-----------------------------------------
+* ``defaultType="linear"`` is required for USDT-margined linear perpetuals.
+  ``"future"`` only grants access to OHLCV, not derivative metrics.
+* Symbols must be passed in contract form: ``"BTC/USDT"`` → ``"BTC/USDT:USDT"``.
+* ``fetch_open_interest`` returns ``openInterestAmount`` (base currency); the
+  ``openInterestValue`` (USD) field is None on Bybit.
+* ``fetch_long_short_ratio`` raises ``NotSupported`` for Bybit; we call the
+  raw V5 endpoint ``publicGetV5MarketAccountRatio`` directly and derive the
+  ratio from ``buyRatio / sellRatio``.
+
+DerivativesSnapshot always stores the canonical symbol (``"BTC/USDT"``), not
+the internal contract form.
 """
 from __future__ import annotations
 
@@ -73,6 +87,24 @@ async def _call_with_retry(fn: Any, *args: Any, label: str) -> Any:
     return None
 
 
+# ── Symbol helpers ─────────────────────────────────────────────────────────────
+
+def _to_contract_symbol(symbol: str, exchange_id: str) -> str:
+    """Convert canonical symbol to exchange contract form.
+
+    Bybit linear perpetuals require ``"BTC/USDT:USDT"`` rather than ``"BTC/USDT"``.
+    Other exchanges receive the symbol unchanged.
+    """
+    if exchange_id == "bybit":
+        return f"{symbol}:USDT"
+    return symbol
+
+
+def _to_raw_symbol(contract: str) -> str:
+    """Strip the margin suffix and slash: ``"BTC/USDT:USDT"`` → ``"BTCUSDT"``."""
+    return contract.split(":")[0].replace("/", "")
+
+
 # ── Per-metric fetchers ────────────────────────────────────────────────────────
 
 async def _fetch_funding_rate(ex: ccxt_async.Exchange, symbol: str) -> float | None:
@@ -90,19 +122,55 @@ async def _fetch_open_interest(ex: ccxt_async.Exchange, symbol: str) -> float | 
     if raw is None:
         return None
     try:
-        # Prefer USD-denominated value; fall back to base-currency amount.
+        # Bybit linear returns openInterestAmount (base currency); openInterestValue is None.
+        # Binance and others return openInterestValue (USD-denominated).
         val = (
-            raw.get("openInterestValue")
-            or raw.get("openInterestAmount")
-            or raw.get("openInterest")
+            raw.get("openInterestAmount")   # Bybit linear — non-None
+            or raw.get("openInterestValue") # Binance USD-denominated
+            or raw.get("openInterest")      # legacy / other exchanges
         )
         return float(val) if val is not None else None
     except (TypeError, ValueError):
         return None
 
 
+async def _fetch_lsr_bybit(ex: ccxt_async.Exchange, symbol: str) -> float | None:
+    """Fetch L/S ratio from Bybit V5 ``publicGetV5MarketAccountRatio``.
+
+    ccxt's unified ``fetch_long_short_ratio`` raises ``NotSupported`` for Bybit,
+    so we call the raw endpoint directly.  Returns ``buyRatio / sellRatio``.
+
+    ``symbol`` is the contract form (e.g. ``"BTC/USDT:USDT"``).
+    """
+    raw_sym = _to_raw_symbol(symbol)
+    resp = await _call_with_retry(
+        ex.publicGetV5MarketAccountRatio,
+        {"category": "linear", "symbol": raw_sym, "period": "5min", "limit": 1},
+        label=f"lsr_bybit:{symbol}",
+    )
+    if resp is None:
+        return None
+    try:
+        items: list[dict[str, Any]] = (resp.get("result") or {}).get("list") or []
+        if not items:
+            return None
+        buy = float(items[0]["buyRatio"])
+        sell = float(items[0]["sellRatio"])
+        return round(buy / sell, 6) if sell > 0 else None
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 async def _fetch_long_short_ratio(ex: ccxt_async.Exchange, symbol: str) -> float | None:
-    # fetch_long_short_ratio returns a list ordered oldest→newest; take last.
+    """Fetch long/short ratio, dispatching to the Bybit V5 path when needed.
+
+    Bybit's ``fetch_long_short_ratio`` raises ``NotSupported``, so for Bybit we
+    call ``publicGetV5MarketAccountRatio`` and compute ``buyRatio / sellRatio``.
+    All other exchanges use the unified ccxt method.
+    """
+    if getattr(ex, "id", None) == "bybit":
+        return await _fetch_lsr_bybit(ex, symbol)
+    # Generic ccxt unified path (Binance, etc.)
     raw = await _call_with_retry(
         ex.fetch_long_short_ratio, symbol, "5m", label=f"lsr:{symbol}"
     )
@@ -122,18 +190,24 @@ async def fetch_snapshot_for_symbol(
     ex: ccxt_async.Exchange,
     symbol: str,
 ) -> DerivativesSnapshot | None:
-    """Fetch all three metrics concurrently; return None only when all fail."""
+    """Fetch all three metrics concurrently; return None only when all fail.
+
+    ``symbol`` is the canonical form (``"BTC/USDT"``).  This function converts
+    it to the exchange-specific contract form for all API calls, then stores the
+    canonical symbol in the returned snapshot.
+    """
     ts = datetime.now(UTC)
+    contract = _to_contract_symbol(symbol, getattr(ex, "id", ""))
     fr, oi, lsr = await asyncio.gather(
-        _fetch_funding_rate(ex, symbol),
-        _fetch_open_interest(ex, symbol),
-        _fetch_long_short_ratio(ex, symbol),
+        _fetch_funding_rate(ex, contract),
+        _fetch_open_interest(ex, contract),
+        _fetch_long_short_ratio(ex, contract),
     )
     if fr is None and oi is None and lsr is None:
         log.warning("derivatives_all_metrics_failed", symbol=symbol)
         return None
     return DerivativesSnapshot(
-        symbol=symbol,
+        symbol=symbol,          # canonical form, not the contract alias
         ts=ts,
         funding_rate=fr,
         open_interest=oi,
@@ -161,7 +235,7 @@ async def get_prev_derivatives(
     symbol: str,
     session: AsyncSession,
 ) -> DerivativesSnapshot | None:
-    """Return the second-latest snapshot for *symbol*, used to compute ΔOI.
+    """Return the second-latest snapshot for *symbol*, used to compute delta-OI.
 
     Returns None when fewer than two snapshots exist (cold start / early run).
     """
@@ -180,7 +254,11 @@ async def get_prev_derivatives(
 def _build_exchange(s: Settings) -> ccxt_async.Exchange:
     opts: dict[str, Any] = {
         "enableRateLimit": True,
-        "options": {"defaultType": "future"},
+        # Bybit: "linear" is required for USDT-margined perpetuals (funding/OI/LSR).
+        # Binance: "future" covers USD-M futures which expose all three metrics.
+        "options": {
+            "defaultType": "linear" if s.collector_exchange == "bybit" else "future"
+        },
     }
     if s.collector_exchange == "bybit":
         ex: ccxt_async.Exchange = ccxt_async.bybit(opts)

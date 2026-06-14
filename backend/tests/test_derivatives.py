@@ -12,7 +12,10 @@ from app.collectors.derivatives import (
     _call_with_retry,
     _fetch_funding_rate,
     _fetch_long_short_ratio,
+    _fetch_lsr_bybit,
     _fetch_open_interest,
+    _to_contract_symbol,
+    _to_raw_symbol,
     collect_derivatives,
     fetch_snapshot_for_symbol,
     get_latest_derivatives,
@@ -21,11 +24,35 @@ from app.db.models import DerivativesSnapshot
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _make_exchange(**methods: Any) -> MagicMock:
+def _make_exchange(exchange_id: str = "binance", **methods: Any) -> MagicMock:
     ex = MagicMock()
+    ex.id = exchange_id
     for name, val in methods.items():
         setattr(ex, name, val)
     return ex
+
+
+# ── Symbol helpers ────────────────────────────────────────────────────────────
+
+class TestSymbolHelpers:
+    def test_to_contract_symbol_bybit(self) -> None:
+        assert _to_contract_symbol("BTC/USDT", "bybit") == "BTC/USDT:USDT"
+
+    def test_to_contract_symbol_binance_unchanged(self) -> None:
+        assert _to_contract_symbol("BTC/USDT", "binance") == "BTC/USDT"
+
+    def test_to_contract_symbol_unknown_exchange_unchanged(self) -> None:
+        assert _to_contract_symbol("ETH/USDT", "") == "ETH/USDT"
+
+    def test_to_raw_symbol_strips_margin_and_slash(self) -> None:
+        assert _to_raw_symbol("BTC/USDT:USDT") == "BTCUSDT"
+
+    def test_to_raw_symbol_no_margin_suffix(self) -> None:
+        # plain symbol without margin suffix should still strip slash
+        assert _to_raw_symbol("BTC/USDT") == "BTCUSDT"
+
+    def test_to_raw_symbol_eth(self) -> None:
+        assert _to_raw_symbol("ETH/USDT:USDT") == "ETHUSDT"
 
 
 # ── _call_with_retry ──────────────────────────────────────────────────────────
@@ -101,23 +128,34 @@ class TestFetchFundingRate:
 # ── _fetch_open_interest ──────────────────────────────────────────────────────
 
 class TestFetchOpenInterest:
-    async def test_prefers_value_field(self) -> None:
+    async def test_prefers_amount_field(self) -> None:
+        # openInterestAmount (Bybit linear) wins over openInterestValue when both present
         ex = _make_exchange(fetch_open_interest=AsyncMock(
-            return_value={"openInterestValue": 1_000_000.0, "openInterestAmount": 20.0}
+            return_value={"openInterestAmount": 20.0, "openInterestValue": 1_000_000.0}
+        ))
+        assert await _fetch_open_interest(ex, "BTC/USDT:USDT") == pytest.approx(20.0)
+
+    async def test_fallback_to_value_field(self) -> None:
+        # openInterestValue (Binance USD-denominated) used when amount not present
+        ex = _make_exchange(fetch_open_interest=AsyncMock(
+            return_value={"openInterestValue": 1_000_000.0}
         ))
         assert await _fetch_open_interest(ex, "BTC/USDT") == pytest.approx(1_000_000.0)
-
-    async def test_fallback_to_amount_field(self) -> None:
-        ex = _make_exchange(fetch_open_interest=AsyncMock(
-            return_value={"openInterestAmount": 20.0}
-        ))
-        assert await _fetch_open_interest(ex, "BTC/USDT") == pytest.approx(20.0)
 
     async def test_legacy_open_interest_field(self) -> None:
         ex = _make_exchange(fetch_open_interest=AsyncMock(
             return_value={"openInterest": 15.5}
         ))
         assert await _fetch_open_interest(ex, "BTC/USDT") == pytest.approx(15.5)
+
+    async def test_bybit_none_value_uses_amount(self) -> None:
+        # Bybit returns openInterestValue=None; code must skip it and take openInterestAmount
+        ex = _make_exchange(fetch_open_interest=AsyncMock(
+            return_value={"openInterestAmount": 53148.1, "openInterestValue": None}
+        ))
+        # None is falsy, so `None or 53148.1` picks the amount correctly
+        result = await _fetch_open_interest(ex, "BTC/USDT:USDT")
+        assert result == pytest.approx(53148.1)
 
     async def test_not_supported_returns_none(self) -> None:
         ex = _make_exchange(
@@ -134,9 +172,74 @@ class TestFetchOpenInterest:
         assert result is None
 
 
+# ── _fetch_lsr_bybit ──────────────────────────────────────────────────────────
+
+class TestFetchLsrBybit:
+    async def test_success_computes_buy_sell_ratio(self) -> None:
+        ex = _make_exchange(
+            exchange_id="bybit",
+            publicGetV5MarketAccountRatio=AsyncMock(return_value={
+                "result": {"list": [{"buyRatio": "0.6", "sellRatio": "0.4"}]}
+            }),
+        )
+        result = await _fetch_lsr_bybit(ex, "BTC/USDT:USDT")
+        assert result == pytest.approx(1.5)   # 0.6 / 0.4
+
+    async def test_raw_symbol_derived_from_contract(self) -> None:
+        """V5 API must receive BTCUSDT, not BTC/USDT:USDT."""
+        ex = _make_exchange(
+            exchange_id="bybit",
+            publicGetV5MarketAccountRatio=AsyncMock(return_value={
+                "result": {"list": [{"buyRatio": "0.55", "sellRatio": "0.45"}]}
+            }),
+        )
+        await _fetch_lsr_bybit(ex, "BTC/USDT:USDT")
+        ex.publicGetV5MarketAccountRatio.assert_awaited_once_with(
+            {"category": "linear", "symbol": "BTCUSDT", "period": "5min", "limit": 1}
+        )
+
+    async def test_empty_list_returns_none(self) -> None:
+        ex = _make_exchange(
+            exchange_id="bybit",
+            publicGetV5MarketAccountRatio=AsyncMock(return_value={
+                "result": {"list": []}
+            }),
+        )
+        assert await _fetch_lsr_bybit(ex, "BTC/USDT:USDT") is None
+
+    async def test_sell_ratio_zero_returns_none(self) -> None:
+        ex = _make_exchange(
+            exchange_id="bybit",
+            publicGetV5MarketAccountRatio=AsyncMock(return_value={
+                "result": {"list": [{"buyRatio": "1.0", "sellRatio": "0.0"}]}
+            }),
+        )
+        assert await _fetch_lsr_bybit(ex, "BTC/USDT:USDT") is None
+
+    async def test_missing_result_returns_none(self) -> None:
+        ex = _make_exchange(
+            exchange_id="bybit",
+            publicGetV5MarketAccountRatio=AsyncMock(return_value={}),
+        )
+        assert await _fetch_lsr_bybit(ex, "BTC/USDT:USDT") is None
+
+    async def test_network_error_returns_none(self) -> None:
+        ex = _make_exchange(
+            exchange_id="bybit",
+            publicGetV5MarketAccountRatio=AsyncMock(
+                side_effect=ccxt.NetworkError("timeout")
+            ),
+        )
+        with patch("app.collectors.derivatives.asyncio.sleep", new_callable=AsyncMock):
+            result = await _fetch_lsr_bybit(ex, "BTC/USDT:USDT")
+        assert result is None
+
+
 # ── _fetch_long_short_ratio ───────────────────────────────────────────────────
 
 class TestFetchLongShortRatio:
+    # ── Generic (non-Bybit) path ─────────────────────────────────────────────
+
     async def test_success_list_response(self) -> None:
         ex = _make_exchange(fetch_long_short_ratio=AsyncMock(
             return_value=[{"longShortRatio": 1.5, "timestamp": 123}]
@@ -168,6 +271,40 @@ class TestFetchLongShortRatio:
         ))
         await _fetch_long_short_ratio(ex, "BTC/USDT")
         ex.fetch_long_short_ratio.assert_awaited_once_with("BTC/USDT", "5m")
+
+    # ── Bybit path (V5 raw endpoint) ─────────────────────────────────────────
+
+    async def test_bybit_dispatches_to_v5_endpoint(self) -> None:
+        ex = _make_exchange(
+            exchange_id="bybit",
+            publicGetV5MarketAccountRatio=AsyncMock(return_value={
+                "result": {"list": [{"buyRatio": "0.6", "sellRatio": "0.4"}]}
+            }),
+        )
+        result = await _fetch_long_short_ratio(ex, "BTC/USDT:USDT")
+        assert result == pytest.approx(1.5)
+        ex.publicGetV5MarketAccountRatio.assert_awaited_once()
+
+    async def test_bybit_does_not_call_unified_lsr_method(self) -> None:
+        """unified fetch_long_short_ratio must never be called for Bybit."""
+        ex = _make_exchange(
+            exchange_id="bybit",
+            publicGetV5MarketAccountRatio=AsyncMock(return_value={
+                "result": {"list": [{"buyRatio": "0.5", "sellRatio": "0.5"}]}
+            }),
+            fetch_long_short_ratio=AsyncMock(return_value=[{"longShortRatio": 99.0}]),
+        )
+        await _fetch_long_short_ratio(ex, "BTC/USDT:USDT")
+        ex.fetch_long_short_ratio.assert_not_awaited()
+
+    async def test_bybit_v5_error_returns_none(self) -> None:
+        ex = _make_exchange(
+            exchange_id="bybit",
+            publicGetV5MarketAccountRatio=AsyncMock(
+                side_effect=ccxt.NotSupported("blocked")
+            ),
+        )
+        assert await _fetch_long_short_ratio(ex, "BTC/USDT:USDT") is None
 
 
 # ── fetch_snapshot_for_symbol ─────────────────────────────────────────────────
@@ -215,6 +352,40 @@ class TestFetchSnapshotForSymbol:
         snap = await fetch_snapshot_for_symbol(ex, "BTC/USDT")
         assert snap is not None
         assert snap.ts.tzinfo is not None
+
+    async def test_bybit_converts_symbol_to_contract_form(self) -> None:
+        """For Bybit: sub-fetchers receive 'BTC/USDT:USDT'; snapshot stores 'BTC/USDT'."""
+        ex = _make_exchange(
+            exchange_id="bybit",
+            fetch_funding_rate=AsyncMock(return_value={"fundingRate": -0.0001}),
+            fetch_open_interest=AsyncMock(
+                return_value={"openInterestAmount": 53148.1, "openInterestValue": None}
+            ),
+            publicGetV5MarketAccountRatio=AsyncMock(return_value={
+                "result": {"list": [{"buyRatio": "0.6", "sellRatio": "0.4"}]}
+            }),
+        )
+        snap = await fetch_snapshot_for_symbol(ex, "BTC/USDT")
+        assert snap is not None
+        assert snap.symbol == "BTC/USDT"  # canonical form, not contract alias
+        # Verify contract form was passed to sub-fetchers
+        ex.fetch_funding_rate.assert_awaited_once_with("BTC/USDT:USDT")
+        ex.fetch_open_interest.assert_awaited_once_with("BTC/USDT:USDT")
+        # V5 endpoint used (not unified fetch_long_short_ratio)
+        ex.publicGetV5MarketAccountRatio.assert_awaited_once()
+        assert snap.open_interest == pytest.approx(53148.1)
+        assert snap.long_short_ratio == pytest.approx(1.5)
+
+    async def test_bybit_snapshot_stores_canonical_symbol(self) -> None:
+        ex = _make_exchange(
+            exchange_id="bybit",
+            fetch_funding_rate=AsyncMock(return_value={"fundingRate": 0.0}),
+            fetch_open_interest=AsyncMock(side_effect=ccxt.NotSupported("no")),
+            publicGetV5MarketAccountRatio=AsyncMock(side_effect=ccxt.NotSupported("no")),
+        )
+        snap = await fetch_snapshot_for_symbol(ex, "ETH/USDT")
+        assert snap is not None
+        assert snap.symbol == "ETH/USDT"  # not "ETH/USDT:USDT"
 
 
 # ── get_latest_derivatives ────────────────────────────────────────────────────
@@ -266,6 +437,7 @@ class TestGetLatestDerivatives:
 class TestCollectDerivatives:
     async def test_saves_snapshots_for_all_symbols(self) -> None:
         mock_ex = MagicMock()
+        mock_ex.id = "binance"
         mock_ex.load_markets = AsyncMock()
         mock_ex.close = AsyncMock()
         mock_ex.fetch_funding_rate = AsyncMock(return_value={"fundingRate": 0.0001})
@@ -316,6 +488,7 @@ class TestCollectDerivatives:
 
     async def test_all_symbols_fail_does_not_save(self) -> None:
         mock_ex = MagicMock()
+        mock_ex.id = "binance"
         mock_ex.load_markets = AsyncMock()
         mock_ex.close = AsyncMock()
         mock_ex.fetch_funding_rate = AsyncMock(side_effect=ccxt.NotSupported("no"))
