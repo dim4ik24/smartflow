@@ -18,10 +18,12 @@ Runtime: ~5-15 min depending on CPU (SMC analysis × windows × symbols × TFs).
 from __future__ import annotations
 
 import asyncio
+import bisect
 import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
@@ -37,9 +39,12 @@ from sqlalchemy import func, select
 from app.analysis import indicators, smc
 from app.analysis.scoring import detect_structure_direction, score_setup
 from app.config import settings
-from app.db.models import Candle
+from app.db.models import Candle, DerivativesSnapshot
 from app.db.session import AsyncSessionLocal, Base
 from app.db.session import engine as db_engine
+
+# Type alias: symbol → sorted list of (naive-UTC datetime, funding_rate)
+FundingHistory = dict[str, list[tuple[datetime, float]]]
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -137,6 +142,65 @@ async def _load_df(symbol: str, tf: str, session, limit: int) -> pd.DataFrame:
     )
 
 
+# ── Historical funding rate ───────────────────────────────────────────────────
+
+# Bybit settles funding every 8h (00:00 / 08:00 / 16:00 UTC).
+# limit=200 → 200 × 8h = 1 600h ≈ 66 days, which covers our 2-month scan.
+_FUNDING_LIMIT = 200
+
+
+def _fetch_funding_history_sync(symbol: str) -> list[tuple[datetime, float]]:
+    """Fetch funding rate history from exchange; return [(naive-UTC dt, rate), ...]."""
+    import ccxt  # local import keeps top-level clean for scripts that don't need it
+
+    opts: dict = {"enableRateLimit": True, "options": {"defaultType": "linear"}}
+    if settings.collector_exchange == "bybit":
+        ex: ccxt.Exchange = ccxt.bybit(opts)
+        contract = f"{symbol}:USDT"
+    else:
+        ex = ccxt.binance(opts)
+        contract = symbol
+
+    try:
+        rows = ex.fetch_funding_rate_history(contract, limit=_FUNDING_LIMIT)
+    except Exception as exc:
+        print(f"  WARNING: funding history fetch failed for {symbol}: {exc}")
+        return []
+
+    result: list[tuple[datetime, float]] = []
+    for row in rows or []:
+        ts_ms = row.get("timestamp")
+        rate = row.get("fundingRate")
+        if ts_ms is not None and rate is not None:
+            dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
+            result.append((dt, float(rate)))
+    result.sort(key=lambda x: x[0])
+    return result
+
+
+async def _prefetch_funding(symbols: list[str]) -> FundingHistory:
+    """Fetch funding rate history for all symbols concurrently via thread pool."""
+    loop = asyncio.get_running_loop()
+    histories = await asyncio.gather(
+        *[loop.run_in_executor(None, _fetch_funding_history_sync, sym) for sym in symbols]
+    )
+    return dict(zip(symbols, histories))
+
+
+def _lookup_funding(history: list[tuple[datetime, float]], at: pd.Timestamp) -> float | None:
+    """Return the funding rate active at candle time `at` (most recent settlement ≤ at).
+
+    Uses binary search on the sorted history list.  Returns None when history is
+    empty or all settlements are after `at` (e.g. the earliest candle pre-dates data).
+    """
+    if not history:
+        return None
+    at_dt: datetime = at.to_pydatetime()  # pandas Timestamp → naive datetime
+    timestamps = [h[0] for h in history]
+    idx = bisect.bisect_right(timestamps, at_dt) - 1
+    return history[idx][1] if idx >= 0 else None
+
+
 # ── Single-combination scan ────────────────────────────────────────────────────
 
 def _scan(
@@ -144,6 +208,7 @@ def _scan(
     tf: str,
     df_entry: pd.DataFrame,
     df_4h: pd.DataFrame,
+    funding_history: FundingHistory,
 ) -> CalibStats:
     stats = CalibStats(symbol=symbol, tf=tf)
     step = STEP_CANDLES[tf]
@@ -180,6 +245,17 @@ def _scan(
         current_atr   = float(atr_val)
         current_price = float(win_entry["close"].iloc[-1])
 
+        # Inject historical funding rate for this candle's timestamp so
+        # funding_extreme is scored with real data, not always-None.
+        hist_fr = _lookup_funding(funding_history.get(symbol, []), current_ts)
+        hist_deriv = DerivativesSnapshot(
+            symbol=symbol,
+            ts=current_ts.to_pydatetime(),
+            funding_rate=hist_fr,
+            open_interest=None,   # OI history not pre-fetched (weight=3, minor)
+            long_short_ratio=None,  # LSR history not pre-fetched (weight=2, minor)
+        )
+
         result = score_setup(
             symbol=symbol,
             side=side,
@@ -187,7 +263,7 @@ def _scan(
             zones_entry=zones_entry,
             zones_ctx=zones_ctx,
             atr=current_atr,
-            derivatives=None,
+            derivatives=hist_deriv,
             prev_derivatives=None,
             avg_sentiment=None,
         )
@@ -376,13 +452,17 @@ def _print_report(all_stats: list[CalibStats]) -> None:
             print(f"    {k:20s}  {pct:4.1f}%  weight={w}")
         print()
 
-    print("  Note: 'sentiment' and 'funding/OI/LSR' factors require live data")
-    print("  (derivatives + Gemini) and score 0 in this offline scan.")
-    print("  Effective max score in offline scan:",
-          100 - FACTOR_WEIGHTS["funding_extreme"]
-              - FACTOR_WEIGHTS["oi_rising"]
-              - FACTOR_WEIGHTS["lsr_confirms"]
-              - FACTOR_WEIGHTS["sentiment_agrees"])
+    print("  Data sources used in this scan:")
+    print("    funding_extreme : HISTORICAL (Bybit API, ~66 days)")
+    print("    oi_rising       : offline — OI history not fetched (weight=3)")
+    print("    lsr_confirms    : offline — LSR history not fetched (weight=2)")
+    print("    sentiment_agrees: offline — requires live Gemini API (weight=10)")
+    eff_max = (100
+               - FACTOR_WEIGHTS["oi_rising"]
+               - FACTOR_WEIGHTS["lsr_confirms"]
+               - FACTOR_WEIGHTS["sentiment_agrees"])
+    print(f"  Effective max score in this scan: {eff_max}"
+          f"  (if funding fires; without funding: {eff_max - FACTOR_WEIGHTS['funding_extreme']})")
     print()
 
 
@@ -422,6 +502,17 @@ async def main() -> None:
                 print(f"  {sym} {tf}: {len(df)} rows"
                       + (f"  [{df.index[0]} → {df.index[-1]}]" if len(df) > 0 else "  EMPTY"))
 
+    # ── Prefetch historical funding rates ─────────────────────────────────────
+    print("\nFetching historical funding rates (Bybit, last ~66 days)...")
+    funding_history = await _prefetch_funding(SYMBOLS)
+    for sym, hist in funding_history.items():
+        if hist:
+            print(f"  {sym}: {len(hist)} settlements  "
+                  f"[{hist[0][0].date()} → {hist[-1][0].date()}]  "
+                  f"latest={hist[-1][1]:.6f}")
+        else:
+            print(f"  {sym}: no data (offline scan will use funding=None)")
+
     # ── Scan ──────────────────────────────────────────────────────────────────
     print(f"\nScanning (SMC_WINDOW={SMC_WINDOW}, step=24h)...")
     print("This may take 5-20 minutes.\n")
@@ -442,7 +533,7 @@ async def main() -> None:
 
             print(f"  [{sym} {tf}] ~{n_windows} windows...", end="", flush=True)
             t1 = time.perf_counter()
-            stats = _scan(sym, tf, df_entry, df_4h)
+            stats = _scan(sym, tf, df_entry, df_4h, funding_history)
             elapsed = time.perf_counter() - t1
             print(f"  valid={stats.valid_setups}/{stats.windows_scanned}"
                   f"  days={stats.days_covered:.0f}  ({elapsed:.0f}s)")
