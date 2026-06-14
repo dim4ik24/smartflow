@@ -395,11 +395,111 @@ async def _diagnose_pair(symbol: str, tf: str, session) -> None:
         print("\n  [PASS] Score OK -> engine will create signal + dispatch alert")
 
 
+# ── Force-signal: bypass ATR/width guard for test chart generation ─────────────
+
+async def _force_test_signal(symbol: str, tf: str, bot, sess) -> Signal | None:
+    """Generate a test signal using relaxed OB distance (50× ATR) for chart demos.
+
+    Uses score_setup with a modified Settings copy so production guards are
+    not touched.  Returns the persisted Signal or None if no OB found at all.
+    """
+    from app.analysis import engine as eng_mod
+    from app.config import Settings  # noqa: F401  (used below in type annotation)
+
+    limit = settings.analysis_candle_limit
+    ctx_df  = await _load_candles(symbol, CONTEXT_TF, sess, limit)
+    entry_df = await _load_candles(symbol, tf, sess, limit)
+    if len(ctx_df) < _ENGINE_MIN_CANDLES or len(entry_df) < _ENGINE_MIN_CANDLES:
+        print(f"  [force]   {symbol} {tf}: insufficient candles")
+        return None
+
+    try:
+        zones_ctx   = smc.analyze(ctx_df,   confirmed_only=True, include_mitigated=True)
+        zones_entry = smc.analyze(entry_df, confirmed_only=True, include_mitigated=True)
+    except Exception as exc:
+        print(f"  [force]   {symbol} {tf}: SMC failed: {exc}")
+        return None
+
+    side = detect_structure_direction(zones_ctx)
+    if side is None:
+        print(f"  [force]   {symbol} {tf}: no direction")
+        return None
+
+    atr_series   = indicators.atr(entry_df)
+    last_atr_raw = atr_series.iloc[-1]
+    if pd.isna(last_atr_raw) or float(last_atr_raw) <= 0:
+        print(f"  [force]   {symbol} {tf}: ATR invalid")
+        return None
+    current_atr   = float(last_atr_raw)
+    current_price = float(entry_df["close"].iloc[-1])
+
+    derivatives      = await get_latest_derivatives(symbol, sess)
+    prev_derivatives = await get_prev_derivatives(symbol, sess)
+
+    # Very relaxed settings: any OB within 50 ATRs, any width up to 50 %
+    relaxed = settings.model_copy(
+        update={
+            "score_max_entry_atr_distance": 50.0,
+            "score_max_ob_width_pct":       0.50,
+            "signal_min_score":             0,
+        }
+    )
+
+    result = score_setup(
+        symbol=symbol,
+        side=side,
+        current_price=current_price,
+        zones_entry=zones_entry,
+        zones_ctx=zones_ctx,
+        atr=current_atr,
+        derivatives=derivatives,
+        prev_derivatives=prev_derivatives,
+        avg_sentiment=None,
+        s=relaxed,
+    )
+    if result is None:
+        print(f"  [force]   {symbol} {tf}: no OB found even with relaxed guards")
+        return None
+
+    print(
+        f"  [force]   {symbol} {tf}  {result.side.upper()}  score={result.score}\n"
+        f"            Entry  {_p(result.entry_low)} – {_p(result.entry_high)}\n"
+        f"            SL     {_p(result.sl)}   "
+        f"TP1 {_p(result.tp1)}   TP2 {_p(result.tp2)}   R:R {result.rr:.2f}"
+    )
+
+    signal = Signal(
+        symbol=symbol,
+        side=result.side,
+        timeframe=tf,
+        score=result.score,
+        entry_low=result.entry_low,
+        entry_high=result.entry_high,
+        sl=result.sl,
+        tp1=result.tp1,
+        tp2=result.tp2,
+        rr=result.rr,
+        factors=result.factors,
+        zones=result.zones,
+        status="active",
+    )
+    sess.add(signal)
+    await sess.flush()  # assigns id
+    print(f"  [force]   Signal id={signal.id} persisted.")
+
+    if bot is not None:
+        await eng_mod._dispatch_alert(bot, sess, signal, symbol, tf)
+        print("  [force]   Alert dispatched to Telegram.")
+
+    return signal
+
+
 # ── Engine run ────────────────────────────────────────────────────────────────
 
-async def _run_engine(bot) -> None:
+async def _run_engine(bot, *, force_signal: bool = False) -> None:
     from app.analysis import engine as eng_mod
 
+    generated: bool = False
     for symbol in SYMBOLS:
         for tf in ENTRY_TFS:
             try:
@@ -414,10 +514,25 @@ async def _run_engine(bot) -> None:
                         if bot is not None:
                             await eng_mod._dispatch_alert(bot, sess, signal, symbol, tf)
                             print("            Alert dispatched to Telegram.")
+                        generated = True
                     else:
                         print(f"  [none]    no signal  {symbol}  {tf}")
             except Exception as exc:
                 print(f"  [ERROR]   {symbol}  {tf}: {exc}")
+
+    if not generated and force_signal:
+        print(f"\n{'─'*64}")
+        print("No organic signal found — running FORCE-SIGNAL on first viable pair...")
+        for symbol in SYMBOLS:
+            for tf in ENTRY_TFS:
+                try:
+                    async with AsyncSessionLocal() as sess:
+                        sig = await _force_test_signal(symbol, tf, bot, sess)
+                        await sess.commit()
+                        if sig is not None:
+                            return  # one forced signal is enough
+                except Exception as exc:
+                    print(f"  [force-err]  {symbol} {tf}: {exc}")
 
 
 # ── Clear AnalysisState ───────────────────────────────────────────────────────
@@ -437,7 +552,7 @@ async def _clear_analysis_state() -> None:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-async def main(*, force: bool, skip_collect: bool) -> None:
+async def main(*, force: bool, skip_collect: bool, force_signal: bool) -> None:
     # Init DB
     async with db_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -509,7 +624,7 @@ async def main(*, force: bool, skip_collect: bool) -> None:
 
     bot = create_bot()
     try:
-        await _run_engine(bot)
+        await _run_engine(bot, force_signal=force_signal)
     finally:
         try:
             await bot.session.close()
@@ -537,5 +652,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip step 0 (derivatives + news); useful for quick repeat runs",
     )
+    parser.add_argument(
+        "--force-signal",
+        action="store_true",
+        help=(
+            "If no organic signal is found, generate one using relaxed OB guards "
+            "(50x ATR distance, 50%% width) to produce a test chart and Telegram alert."
+        ),
+    )
     args = parser.parse_args()
-    asyncio.run(main(force=args.force, skip_collect=args.skip_collect))
+    asyncio.run(main(
+        force=args.force,
+        skip_collect=args.skip_collect,
+        force_signal=args.force_signal,
+    ))
