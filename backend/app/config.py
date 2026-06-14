@@ -142,6 +142,10 @@ class Settings(BaseSettings):
     # If the mid-entry is further than this the market hasn't reached the zone yet
     # ("setup not ripe") and the candidate is discarded.
     score_max_entry_atr_distance: float = 3.0
+    # Maximum distance (in ATR units) from current price for a FVG to be counted
+    # as "confirming" the setup.  The FVG's price range must overlap the band
+    # [current_price ± score_fvg_max_atr_distance × ATR].
+    score_fvg_max_atr_distance: float = 3.0
     analysis_candle_limit: int = 200
 
     @field_validator("master_encryption_key")

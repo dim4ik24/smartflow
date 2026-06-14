@@ -9,6 +9,7 @@ from app.analysis.scoring import (
     _apply_weights,
     _build_entry_geometry,
     _find_entry_ob,
+    _has_nearby_fvg,
     _has_sweep,
     _in_premium_or_discount,
     detect_structure_direction,
@@ -40,6 +41,8 @@ def _settings(**overrides: object) -> Settings:
         # Test OBs have mid at OB mid ≈ price=100 → distance ≈ 0; keep the default loose
         # so existing tests are not affected by the distance guard.
         "score_max_entry_atr_distance": 3.0,
+        # FVG proximity: match the production default.
+        "score_fvg_max_atr_distance": 3.0,
     }
     defaults.update(overrides)
     s = MagicMock(spec=Settings)
@@ -169,6 +172,59 @@ class TestHasSweep:
 
     def test_no_sweep_zones(self) -> None:
         assert _has_sweep([_ob("long", 99, 101)], "long") is False
+
+
+# ── _has_nearby_fvg ──────────────────────────────────────────────────────────
+
+class TestHasNearbyFvg:
+    """FVG is 'nearby' when its price range overlaps [current_price ± N×ATR]."""
+
+    # price=100, atr=1, N=3 → band = [97, 103]
+
+    def test_fvg_inside_band_returns_true(self) -> None:
+        assert _has_nearby_fvg([_fvg("long", 98.0, 102.0)], "long", 100.0, 1.0, 3.0) is True
+
+    def test_fvg_touching_band_edge_returns_true(self) -> None:
+        # FVG [93, 97.1]: price_to=97.1 > band_lo=97 → just inside
+        assert _has_nearby_fvg([_fvg("long", 93.0, 97.1)], "long", 100.0, 1.0, 3.0) is True
+
+    def test_fvg_outside_band_returns_false(self) -> None:
+        # FVG [104, 108]: price_from=104 >= band_hi=103 → no overlap
+        assert _has_nearby_fvg([_fvg("long", 104.0, 108.0)], "long", 100.0, 1.0, 3.0) is False
+
+    def test_fvg_strictly_below_band_returns_false(self) -> None:
+        # FVG [90, 97]: price_to=97 not > band_lo=97 (strict) → no overlap
+        assert _has_nearby_fvg([_fvg("long", 90.0, 97.0)], "long", 100.0, 1.0, 3.0) is False
+
+    def test_mitigated_fvg_excluded(self) -> None:
+        mitigated = {**_fvg("long", 98.0, 102.0), "mitigated": True}
+        assert _has_nearby_fvg([mitigated], "long", 100.0, 1.0, 3.0) is False
+
+    def test_wrong_direction_excluded(self) -> None:
+        assert _has_nearby_fvg([_fvg("short", 98.0, 102.0)], "long", 100.0, 1.0, 3.0) is False
+
+    def test_non_fvg_zone_excluded(self) -> None:
+        assert _has_nearby_fvg([_ob("long", 98.0, 102.0)], "long", 100.0, 1.0, 3.0) is False
+
+    def test_fvg_outside_ob_but_near_price_detected(self) -> None:
+        # Key regression: FVG does NOT overlap OB [99, 101] but IS within 3 ATR
+        # of current_price=100 → must return True under the new semantics.
+        # FVG [96, 98]: band=[97,103] → price_from=96 < 103 and price_to=98 > 97 → True
+        assert _has_nearby_fvg([_fvg("long", 96.0, 98.0)], "long", 100.0, 1.0, 3.0) is True
+
+    def test_no_fvg_zones_returns_false(self) -> None:
+        assert _has_nearby_fvg([_ob("long", 99.0, 101.0)], "long", 100.0, 1.0, 3.0) is False
+
+    def test_short_bearish_fvg_detected(self) -> None:
+        # Bearish FVG above current price (resistance area) confirms short
+        # FVG [101, 104]: band=[97,103] → price_from=101 < 103 and price_to=104 > 97 → True
+        assert _has_nearby_fvg([_fvg("short", 101.0, 104.0)], "short", 100.0, 1.0, 3.0) is True
+
+    def test_larger_atr_distance_reaches_further(self) -> None:
+        # With N=5: band=[95, 105]; FVG [93, 96] → True (96 > 95)
+        assert _has_nearby_fvg([_fvg("long", 93.0, 96.0)], "long", 100.0, 1.0, 5.0) is True
+        # Same FVG with N=3: band=[97, 103]; price_to=96 not > 97 → False
+        assert _has_nearby_fvg([_fvg("long", 93.0, 96.0)], "long", 100.0, 1.0, 3.0) is False
 
 
 # ── _find_entry_ob ────────────────────────────────────────────────────────────

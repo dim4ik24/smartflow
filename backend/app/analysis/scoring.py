@@ -87,19 +87,31 @@ def _find_entry_ob(
     return max(candidates, key=lambda z: (z.get("strength", 0.0), z.get("time_from") or ""))
 
 
-def _has_fvg_in_zone(
+def _has_nearby_fvg(
     zones: list[dict[str, Any]],
     side: str,
-    low: float,
-    high: float,
+    current_price: float,
+    atr: float,
+    max_atr_distance: float,
 ) -> bool:
-    """True if any active FVG matching side overlaps the [low, high] entry band."""
+    """True if any active FVG matching side lies within max_atr_distance × ATR of current_price.
+
+    Checks that the FVG's price range overlaps the band
+    ``[current_price - max_atr_distance*atr, current_price + max_atr_distance*atr]``.
+
+    The FVG does not need to overlap the entry OB: per SMC theory, an unmitigated
+    FVG in the direction of the trade anywhere near the current price level confirms
+    expected continuation.  The old semantics (FVG inside the narrow OB band) caused
+    fvg=0% because OBs (≤1.5% wide) and FVGs typically form at different price levels.
+    """
+    band_lo = current_price - max_atr_distance * atr
+    band_hi = current_price + max_atr_distance * atr
     return any(
         z["type"] == "FVG"
         and z["direction"] == side
         and not z.get("mitigated", False)
-        and z["price_from"] < high
-        and z["price_to"] > low
+        and z["price_from"] < band_hi
+        and z["price_to"] > band_lo
         for z in zones
     )
 
@@ -200,6 +212,7 @@ def _compute_factors(
     *,
     side: str,
     current_price: float,
+    atr: float,
     entry_ob: dict[str, Any],
     zones_entry: list[dict[str, Any]],
     zones_ctx: list[dict[str, Any]],
@@ -212,8 +225,8 @@ def _compute_factors(
 
     has_sweep = _has_sweep(all_zones, side)
 
-    has_fvg = _has_fvg_in_zone(
-        zones_entry, side, entry_ob["price_from"], entry_ob["price_to"]
+    has_fvg = _has_nearby_fvg(
+        all_zones, side, current_price, atr, s.score_fvg_max_atr_distance
     )
 
     # Both 4h and 1h structural direction must agree with the intended side.
@@ -370,6 +383,7 @@ def score_setup(
     factors = _compute_factors(
         side=side,
         current_price=current_price,
+        atr=atr,
         entry_ob=entry_ob,
         zones_entry=zones_entry,
         zones_ctx=zones_ctx,
