@@ -148,7 +148,7 @@ async def _call_gemini(
                 contents=prompt,
                 config=config,
             )
-            return response.text
+            return str(response.text) if response.text is not None else None
 
         except Exception as exc:
             # Extract HTTP status code if the SDK attaches one.

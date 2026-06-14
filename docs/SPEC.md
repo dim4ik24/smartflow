@@ -115,12 +115,39 @@ news_items   (id PK, source, title, url, symbols JSON,
 7. Gemini-пояснення (кешується в signals.ai_explanation, 1 раз на сигнал)
 8. alerts.py: PNG графіка (mplfinance/plotly) + текст → юзерам за тарифом
 
-## 6. Скоринг (стартові ваги, калібруються бектестом)
-liquidity sweep +25 | retest order block +20 | FVG у зоні входу +10 |
-збіг напряму 4h і 1h структури +15 | екстремальний funding проти
-напряму товпи +10 | ΔOI підтверджує +5 | сентимент новин узгоджений +10 |
-discount для лонга / premium для шорта +5.
-R:R < 2.0 → сигнал відкидається незалежно від score.
+## 6. Скоринг (ваги після офлайн-калібрування; фінал — бектест Etap 7)
+
+### 6.1 Активні фактори (8 шт., сума = 100)
+
+| Фактор | Вага | Умова спрацювання |
+|--------|------|-------------------|
+| liquidity sweep | **+30** | підтверджений LIQ_SWEEP у напрямку угоди |
+| retest order block | **+20** | ціна в межах 1 ATR від активного OB (є entry OB) |
+| structure aligned | **+20** | і 4h, і 1h BOS/CHOCH вказують у напрямку угоди |
+| funding extreme | **+10** | \|funding_rate\| ≥ 0.00005 проти натовпу |
+| sentiment agrees | **+10** | \|avg_sentiment\| ≥ 1.0, новини підтверджують |
+| premium / discount | **+5** | ціна у PREM-зоні (short) або DISC-зоні (long) |
+| ΔOI rising | **+3** | open interest виріс порівняно з попереднім snapshot |
+| LSR confirms | **+2** | long/short ratio на стороні угоди |
+
+### 6.2 Guards (фільтри до scoring)
+
+- **OB width ≤ 1.5%** ширини від ціни — ширші OB є бібліотечними swing-артефактами
+- **OB distance ≤ 3.0 ATR** від поточної ціни до mid OB — "сетап ще не дозрів"
+- **R:R ≥ 2.0** до найближчої liquidity target — сигнал відкидається незалежно від score
+
+### 6.3 Поріг сигналу
+
+`signal_min_score = 55` — стартовий поріг офлайн-калібрування з буфером +5 на
+live-фактори (sentiment+OI+LSR = 15 балів не враховані в офлайн-скані).
+Фінальний поріг визначається бектестом Etap 7 за win rate по score-бакетах.
+
+### 6.4 FVG як future work (Etap 11+)
+
+FVG-фактор вилучений зі скоринга OB-retest сетапів: при ретесті OB ціна
+заповнює всі FVG по дорозі до зони, тому active FVG near entry = 0% hit rate.
+Функція `_has_nearby_fvg` збережена для майбутнього "FVG-entry" типу сетапу,
+де FVG сам є точкою входу (не confluence). Деталі — DECISIONS.md 2026-06-14.
 
 ## 7. Ризик-движок (правила незмінні юзером)
 - розмір позиції = (депозит * risk_pct) / |entry - sl|
