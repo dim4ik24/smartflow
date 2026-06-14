@@ -6,13 +6,14 @@ import asyncio
 from logging.config import fileConfig
 from typing import Any
 
-from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
+
+import app.db.models  # noqa: F401 — registers all models with Base.metadata
+from alembic import context
 
 # Load app settings (reads .env automatically via pydantic-settings).
 from app.config import settings
 from app.db.session import Base
-import app.db.models  # noqa: F401 — registers all models with Base.metadata
 
 alembic_cfg = context.config
 

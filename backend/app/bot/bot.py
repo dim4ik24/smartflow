@@ -43,7 +43,7 @@ def _apply_threaded_resolver(session: AiohttpSession) -> None:
     try:
         from aiohttp.resolver import ThreadedResolver
 
-        session._connector_init["resolver"] = ThreadedResolver()  # type: ignore[attr-defined]
+        session._connector_init["resolver"] = ThreadedResolver()
         log.debug("bot_threaded_resolver_applied")
     except Exception:
         log.warning(

@@ -9,6 +9,7 @@ from aiogram import F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
+    InaccessibleMessage,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -81,7 +82,7 @@ async def accept_disclaimer(callback: CallbackQuery, session: AsyncSession) -> N
         "/stats — статистика\n"
         "/help — довідка"
     )
-    if callback.message is not None:
+    if callback.message is not None and not isinstance(callback.message, InaccessibleMessage):
         await callback.message.edit_text(confirmation)
 
     log.info("disclaimer_accepted", tg_id=tg_user.id, username=tg_user.username)
