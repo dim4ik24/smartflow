@@ -149,8 +149,12 @@ def render_signal_chart(signal: Signal, candles_df: pd.DataFrame) -> bytes:
     price_ax = axes[0]
 
     # ── Zone bands (time-bounded rectangles) ─────────────────────────────────
-    # Each zone is drawn from its formation time (time_from) to the chart's
-    # right edge — not as a full-width axhspan across the entire chart.
+    # mplfinance uses integer x-positions (0 … N-1) internally, not datetime.
+    # Passing df.index (DatetimeIndex) to fill_between would expand the x-axis
+    # to matplotlib date numbers (~738 000), compressing all candles to the left
+    # edge.  We use integer positions and convert time_from to a candle index.
+    n = len(df)
+    x_int = list(range(n))
     for zone in (signal.zones or []):
         ztype = str(zone.get("type", ""))
         color, alpha = _ZONE_COLORS.get(ztype, _ZONE_COLOR_DEFAULT)
@@ -159,31 +163,34 @@ def render_signal_chart(signal: Signal, candles_df: pd.DataFrame) -> bytes:
         if p_lo <= 0 or p_hi <= p_lo:
             continue
 
-        # Determine zone start time; fall back to chart left edge if missing.
+        # Map zone's time_from to a candle index; default to 0 (chart left edge).
+        ix_start = 0
         time_from_raw = zone.get("time_from")
         try:
             zone_ts = pd.Timestamp(time_from_raw)
-            if zone_ts.tzinfo is None:
-                zone_ts = zone_ts.tz_localize("UTC")
-            else:
-                zone_ts = zone_ts.tz_convert("UTC")
-            effective_start = zone_ts if zone_ts > df.index[0] else df.index[0]
+            if zone_ts.tzinfo is not None:
+                zone_ts = zone_ts.tz_localize(None)
+            idx_found = df.index.searchsorted(zone_ts)
+            ix_start = int(min(idx_found, n - 1))
         except Exception:
-            effective_start = df.index[0]
+            ix_start = 0
 
-        mask = df.index >= effective_start
-        if not mask.any():
+        mask_int = [i >= ix_start for i in x_int]
+        if not any(mask_int):
             continue
         price_ax.fill_between(
-            df.index,
+            x_int,
             p_lo,
             p_hi,
-            where=mask,
+            where=mask_int,
             facecolor=color,
             alpha=alpha,
             linewidth=0,
             zorder=0,
         )
+
+    # Restore integer x-axis limits after fill_between (in case it drifted).
+    price_ax.set_xlim(-0.5, n - 0.5)
 
     # ── Key price levels + right-edge labels ──────────────────────────────────
     for attr, color, ls, lw, prefix in _LEVEL_SPECS:
