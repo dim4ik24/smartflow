@@ -336,7 +336,13 @@ def _simulate_trade(
 
     fill_ts = df.index[fill_idx]
 
-    # Phase 2: simulate after fill — pessimistic (SL checked before TP)
+    # Phase 2: simulate after fill — pessimistic (SL checked before TP).
+    #
+    # Within-bar rule for the fill candle (i == fill_idx):
+    #   SL is checked — we may have entered and immediately moved to the stop.
+    #   TP is NOT checked — within-bar candle order after entry is unknown;
+    #   assuming TP fired before SL on the entry bar would be optimistic.
+    # From fill_idx+1 onward both SL and TP are checked normally.
     current_sl = sl
     r_partial  = 0.0        # R already locked from TP1 (50 %)
     tp1_hit    = False
@@ -344,15 +350,16 @@ def _simulate_trade(
     scan_end = min(fill_idx + 1 + max_hold, len(df))
     for i in range(fill_idx, scan_end):
         row = df.iloc[i]
+        is_fill_candle = i == fill_idx
 
         if side == "long":
             sl_breach = row["low"] <= current_sl
-            tp1_level = not tp1_hit and row["high"] >= tp1
-            tp2_level = tp1_hit and row["high"] >= tp2
+            tp1_level = not tp1_hit and not is_fill_candle and row["high"] >= tp1
+            tp2_level = tp1_hit and not is_fill_candle and row["high"] >= tp2
         else:  # short
             sl_breach = row["high"] >= current_sl
-            tp1_level = not tp1_hit and row["low"] <= tp1
-            tp2_level = tp1_hit and row["low"] <= tp2
+            tp1_level = not tp1_hit and not is_fill_candle and row["low"] <= tp1
+            tp2_level = tp1_hit and not is_fill_candle and row["low"] <= tp2
 
         if sl_breach:
             # Full stop: lose 1R. BE stop (after TP1): remaining half exits at

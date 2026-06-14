@@ -146,6 +146,42 @@ class TestSimulateTradeLong:
         assert reason == "sl"
         assert r == pytest.approx(-1.0)
 
+    def test_within_bar_fill_and_sl_simultaneous(self) -> None:
+        """Fill candle that also breaches SL → registered as -1R (pessimistic).
+
+        Even though high=110 would reach TP1=105, within-bar order after entry is
+        unknown.  SL on the fill candle is always checked; TP on the fill candle is
+        never taken.  Result: SL wins.
+        """
+        # high=110 ≥ entry_low=99 (fills) AND low=95 ≤ SL=97 (SL breach) in one candle
+        df = _df(_candle(100, 110, 95, 100))
+        reason, r, fill_ts, exit_ts = self._sim(df)
+        assert reason == "sl"
+        assert r == pytest.approx(-1.0)
+        assert fill_ts is not None
+        assert exit_ts is not None
+
+    def test_within_bar_tp_not_taken_on_fill_candle(self) -> None:
+        """TP must not fire on the fill candle even when high reaches it.
+
+        The fix: on the fill bar, tp1_level is always False regardless of price.
+        Without the fix, this would have returned 'tp1_tp2' or 'tp1_be';
+        with the fix the TP check is deferred to the next candle, and the
+        subsequent SL hit wins → -1R.
+        """
+        # candle 0: fills (low=98 ≤ 101) AND reaches TP1 (high=108 ≥ 105) — TP NOT taken
+        # candle 1: SL hit (should be the result, NOT a TP1 outcome from candle 0)
+        df = _df(
+            _candle(100, 108, 98, 105),   # fill candle — high reaches TP1 but is ignored
+            _candle(100, 101, 96, 97),    # SL hit on the next candle
+        )
+        reason, r, fill_ts, exit_ts = self._sim(df)
+        assert reason == "sl", (
+            f"Expected 'sl' but got '{reason}'. "
+            "TP fired on fill candle — within-bar pessimism violated."
+        )
+        assert r == pytest.approx(-1.0)
+
 
 # ── SHORT trades ───────────────────────────────────────────────────────────────
 
@@ -191,6 +227,33 @@ class TestSimulateTradeShort:
         r1 = (self.MID - self.TP1) / self.RISK * 0.5
         r2 = (self.MID - self.TP2) / self.RISK * 0.5
         assert r == pytest.approx(r1 + r2, abs=1e-6)
+
+    def test_within_bar_fill_and_sl_simultaneous(self) -> None:
+        """Short fill candle that also breaches SL upward → -1R (pessimistic).
+
+        entry zone [99,101], SL=103.  A candle with high=105 fills the zone
+        (high ≥ 99) AND breaches SL (high ≥ 103) simultaneously.  SL wins.
+        """
+        # high=105 ≥ entry_low=99 (fills) AND high=105 ≥ SL=103 (SL breach)
+        df = _df(_candle(100, 105, 99, 100))
+        reason, r, _, _ = self._sim(df)
+        assert reason == "sl"
+        assert r == pytest.approx(-1.0)
+
+    def test_within_bar_tp_not_taken_on_fill_candle(self) -> None:
+        """Short TP must not fire on the fill candle even when low reaches it."""
+        # candle 0: fills (high=101 ≥ 99) AND low=93 ≤ tp1=95 — TP NOT taken
+        # candle 1: SL hit
+        df = _df(
+            _candle(100, 101, 93,  95),   # fill candle — TP1 reachable but ignored
+            _candle(100, 104, 100, 103),  # SL hit on next candle
+        )
+        reason, r, _, _ = self._sim(df)
+        assert reason == "sl", (
+            f"Expected 'sl' but got '{reason}'. "
+            "TP fired on fill candle — within-bar pessimism violated."
+        )
+        assert r == pytest.approx(-1.0)
 
 
 # ── Lookahead safety tests ─────────────────────────────────────────────────────
