@@ -226,6 +226,27 @@ class TestHasNearbyFvg:
         # Same FVG with N=3: band=[97, 103]; price_to=96 not > 97 → False
         assert _has_nearby_fvg([_fvg("long", 93.0, 96.0)], "long", 100.0, 1.0, 3.0) is False
 
+    # ── Recency filter ─────────────────────────────────────────────────────────
+
+    def test_fvg_after_recency_cutoff_detected(self) -> None:
+        fvg = {**_fvg("long", 98.0, 102.0), "time_from": "2026-06-01T00:00:00Z"}
+        assert _has_nearby_fvg([fvg], "long", 100.0, 1.0, 3.0, "2026-05-01T00:00:00Z") is True
+
+    def test_fvg_before_recency_cutoff_excluded(self) -> None:
+        # FVG formed before the cutoff — stale, must be ignored
+        fvg = {**_fvg("long", 98.0, 102.0), "time_from": "2026-04-01T00:00:00Z"}
+        assert _has_nearby_fvg([fvg], "long", 100.0, 1.0, 3.0, "2026-05-01T00:00:00Z") is False
+
+    def test_fvg_at_recency_boundary_included(self) -> None:
+        # time_from exactly equals cutoff → inclusive (>=)
+        fvg = {**_fvg("long", 98.0, 102.0), "time_from": "2026-05-01T00:00:00Z"}
+        assert _has_nearby_fvg([fvg], "long", 100.0, 1.0, 3.0, "2026-05-01T00:00:00Z") is True
+
+    def test_no_recency_cutoff_includes_all_times(self) -> None:
+        # recency_cutoff=None → backward-compatible, no time filter
+        old_fvg = {**_fvg("long", 98.0, 102.0), "time_from": "2020-01-01T00:00:00Z"}
+        assert _has_nearby_fvg([old_fvg], "long", 100.0, 1.0, 3.0, None) is True
+
 
 # ── _find_entry_ob ────────────────────────────────────────────────────────────
 
@@ -657,6 +678,36 @@ class TestScoreSetup:
             s=_settings(score_max_ob_width_pct=0.10, score_max_entry_atr_distance=3.0),
         )
         assert result is None
+
+    def test_fvg_excluded_by_recency_cutoff(self) -> None:
+        # FVG is in ATR-band but older than cutoff → fvg factor must NOT fire
+        old_fvg = {**_fvg("long", 99.5, 100.5), "time_from": "2026-01-01T00:00:00Z"}
+        result = score_setup(
+            symbol="BTC/USDT", side="long", current_price=100.0,
+            zones_entry=[_ob("long", 99.0, 101.0), old_fvg, _bos("long")],
+            zones_ctx=[_bos("long")],
+            atr=1.0, derivatives=None, avg_sentiment=None,
+            fvg_recency_cutoff="2026-02-01T00:00:00Z",   # after the FVG time_from
+            s=_settings(),
+        )
+        assert result is not None
+        assert result.factors["fvg"] is False
+        assert result.score == 20 + 15   # ob_retest + structure_aligned, no fvg
+
+    def test_fvg_within_recency_fires(self) -> None:
+        # Fresh FVG (after cutoff) in ATR-band → fvg factor fires
+        fresh_fvg = {**_fvg("long", 99.5, 100.5), "time_from": "2026-06-01T00:00:00Z"}
+        result = score_setup(
+            symbol="BTC/USDT", side="long", current_price=100.0,
+            zones_entry=[_ob("long", 99.0, 101.0), fresh_fvg, _bos("long")],
+            zones_ctx=[_bos("long")],
+            atr=1.0, derivatives=None, avg_sentiment=None,
+            fvg_recency_cutoff="2026-05-01T00:00:00Z",   # FVG is after this
+            s=_settings(),
+        )
+        assert result is not None
+        assert result.factors["fvg"] is True
+        assert result.score == 20 + 10 + 15   # ob_retest + fvg + structure_aligned
 
     def test_distance_guard_close_ob_produces_valid_result(self) -> None:
         """score_setup returns a result when OB is within 3 ATR of current price."""
