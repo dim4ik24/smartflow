@@ -101,7 +101,7 @@ class Settings(BaseSettings):
 
     # ── Trading defaults ──────────────────────────────────────────────────────
     use_testnet: bool = True
-    signal_min_score: int = Field(default=70, ge=0, le=100)
+    signal_min_score: int = Field(default=55, ge=0, le=100)
     signal_ttl_hours: int = 2
     signal_entry_drift_pct: float = 0.5
     macro_event_window_minutes: int = 30
