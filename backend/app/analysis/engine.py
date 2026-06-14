@@ -18,6 +18,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from aiogram import Bot
 
 import pandas as pd
 import structlog
@@ -304,14 +308,44 @@ async def analyze_symbol_on_close(
     return signal
 
 
+# ── Alert dispatch ────────────────────────────────────────────────────────────
+
+_ALERT_CANDLES = 60  # candles loaded for the chart (mirrors alerts._CHART_CANDLES)
+
+
+async def _dispatch_alert(
+    bot: Bot,
+    session: AsyncSession,
+    signal: Signal,
+    symbol: str,
+    timeframe: str,
+) -> None:
+    """Load chart candles and hand off to the alert dispatcher.
+
+    Isolated so that any failure here cannot bubble up and affect AnalysisState
+    persistence in the caller.  Lazy-imported to avoid hard coupling between
+    app.analysis and app.bot at module load time.
+    """
+    try:
+        from app.bot.alerts import send_signal_alert  # lazy — bot pkg is optional
+        candles_df = await _load_candles(symbol, timeframe, session, limit=_ALERT_CANDLES)
+        await send_signal_alert(bot, session, signal, candles_df)
+    except Exception as exc:
+        log.warning("engine_alert_dispatch_failed", symbol=symbol, error=str(exc))
+
+
 # ── Scheduler job ─────────────────────────────────────────────────────────────
 
-async def run_analysis_cycle() -> None:
+async def run_analysis_cycle(bot: Bot | None = None) -> None:
     """Iterate over all watched symbols and entry timeframes on candle close.
 
     Each symbol+TF runs in its own session so one failure does not block others.
     Always commits after each call: AnalysisState must persist even when no
     signal was produced, to prevent re-analysis of the same candle next cycle.
+
+    If *bot* is provided, a Telegram alert is dispatched after each new Signal.
+    The alert uses the same (committed) session for user queries — safe because
+    AsyncSessionLocal is configured with expire_on_commit=False.
     """
     entry_tfs = [tf for tf in settings.watched_timeframes if tf != "4h"]
     for symbol in settings.watched_symbols:
@@ -320,7 +354,9 @@ async def run_analysis_cycle() -> None:
                 async with AsyncSessionLocal() as session:
                     signal = await analyze_symbol_on_close(symbol, tf, session)
                     await session.commit()   # always: persists AnalysisState + optional Signal
-                    if signal:
+                    if signal is not None:
                         log.info("engine_cycle_signal", symbol=symbol, tf=tf, id=signal.id)
+                        if bot is not None:
+                            await _dispatch_alert(bot, session, signal, symbol, tf)
             except Exception as exc:
                 log.error("engine_cycle_error", symbol=symbol, tf=tf, error=str(exc))
