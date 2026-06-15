@@ -324,11 +324,20 @@ def _simulate_trade(
     if risk <= 0:
         return "no_fill", 0.0, None, None
 
-    # Phase 1: find fill (first candle whose OHLCV overlaps the OB zone)
+    # Phase 1: find fill — limit-order semantics: price must reach mid_entry.
+    # Long:  price must come DOWN to mid_entry → row["low"]  <= mid_entry.
+    # Short: price must come UP   to mid_entry → row["high"] >= mid_entry.
+    # The old "zone overlap" check (high>=entry_low AND low<=entry_high) fired
+    # when a candle merely clipped the zone edge, creating phantom fills and
+    # inflating WR by ~50 pp (confirmed by midR=NO→73% vs midR=YES→23% audit).
     fill_idx: int | None = None
     for i in range(min(max_fill, len(df))):
         row = df.iloc[i]
-        if row["high"] >= entry_low and row["low"] <= entry_high:
+        if side == "long":
+            reached = row["low"] <= mid_entry
+        else:
+            reached = row["high"] >= mid_entry
+        if reached:
             fill_idx = i
             break
 
@@ -689,16 +698,48 @@ def print_report(
 
     # ── Exit reason distribution ───────────────────────────────────────────────
     print(f"\n{'─'*72}")
-    print("  EXIT REASON DISTRIBUTION  (filled trades)")
+    print("  EXIT REASON DISTRIBUTION  (all signals)")
     print(f"{'─'*72}")
     reasons: dict[str, int] = defaultdict(int)
     for t in all_trades:
         reasons[t.exit_reason] += 1
-    n_filled = sum(1 for t in all_trades if t.fill_ts)
     for reason, cnt in sorted(reasons.items(), key=lambda x: -x[1]):
         pct = cnt / len(all_trades) * 100
         bar = _bar(pct / 100)
         print(f"  {reason:14s}  {bar}  {cnt:4d}  ({pct:.1f}%)")
+
+    # ── hold_expired bias diagnostic ──────────────────────────────────────────
+    print(f"\n{'─'*72}")
+    print("  HOLD_EXPIRED BIAS DIAGNOSTIC")
+    print(f"{'─'*72}")
+    he_trades = [t for t in all_trades if t.exit_reason == "hold_expired"]
+    tp_sl_trades = [t for t in all_trades
+                    if t.exit_reason in ("sl", "tp1_be", "tp1_tp2")]
+    if he_trades:
+        he_avg  = sum(t.r_outcome for t in he_trades) / len(he_trades)
+        he_tot  = sum(t.r_outcome for t in he_trades)
+        he_pos  = sum(1 for t in he_trades if t.r_outcome > 0) / len(he_trades) * 100
+        print(f"  hold_expired trades : {len(he_trades):4d}  "
+              f"avg R: {he_avg:+.3f}  total R: {he_tot:+.2f}  "
+              f"positive: {he_pos:.0f}%")
+        print(f"  (MAX_HOLD {MAX_HOLD_CANDLES['1h']}×1h = "
+              f"{MAX_HOLD_CANDLES['1h']}h ≈ "
+              f"{MAX_HOLD_CANDLES['1h']//24}d; "
+              f"close-at-expiry rewards trend, penalises reversals)")
+    else:
+        print("  No hold_expired trades.")
+
+    if tp_sl_trades:
+        n = len(tp_sl_trades)
+        wr  = sum(1 for t in tp_sl_trades if t.r_outcome > 0) / n
+        ar  = sum(t.r_outcome for t in tp_sl_trades) / n
+        lr  = sum(abs(t.r_outcome) for t in tp_sl_trades if t.r_outcome < 0) or 1e-9
+        wr_ = sum(t.r_outcome for t in tp_sl_trades if t.r_outcome > 0)
+        pf  = wr_ / lr
+        print(f"\n  TP/SL-only  (sl + tp1_be + tp1_tp2, n={n}):")
+        print(f"  WinR: {wr*100:.1f}%  |  AvgR: {ar:+.3f}  |  PF: {pf:.2f}")
+    else:
+        print("\n  No TP/SL-closed trades found.")
 
     print()
 

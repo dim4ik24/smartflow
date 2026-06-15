@@ -339,6 +339,121 @@ class TestNoLookahead:
                 )
 
 
+# ── Phantom fill prevention ────────────────────────────────────────────────────
+
+class TestPhantomFillPrevention:
+    """Verify the corrected limit-order fill condition.
+
+    A phantom fill happens when a candle clips the OB zone edge but price never
+    reaches mid_entry (the actual limit price).  The old condition
+    (high >= entry_low AND low <= entry_high) could trigger on such candles,
+    inflating WR by ~50 pp.  The fix: long fills only when low <= mid_entry;
+    short fills only when high >= mid_entry.
+    """
+
+    # Common zone: [99, 101], mid=100
+    EL, EH, MID = 99.0, 101.0, 100.0
+    SL_LONG, TP1_LONG, TP2_LONG = 97.0, 105.0, 109.0
+    SL_SHORT, TP1_SHORT, TP2_SHORT = 103.0, 95.0, 91.0
+
+    def _sim_long(self, df: pd.DataFrame) -> tuple[str, float, object, object]:
+        return _simulate_trade(
+            df, "long", self.EL, self.EH, self.SL_LONG, self.TP1_LONG, self.TP2_LONG, "1h"
+        )
+
+    def _sim_short(self, df: pd.DataFrame) -> tuple[str, float, object, object]:
+        return _simulate_trade(
+            df, "short", self.EL, self.EH, self.SL_SHORT, self.TP1_SHORT, self.TP2_SHORT, "1h"
+        )
+
+    def test_long_no_fill_when_low_above_mid(self) -> None:
+        """Long: candle clips zone (low <= entry_high) but low > mid → no fill.
+
+        Candle low=100.5 enters the zone [99,101] from above but never reaches
+        the limit at mid=100.  Old code would have filled here (phantom fill).
+        """
+        df = _df(_candle(102.0, 103.0, 100.5, 101.5))  # low=100.5 > mid=100
+        reason, r, fill_ts, _ = self._sim_long(df)
+        assert reason == "no_fill", (
+            f"Phantom fill: low=100.5 > mid={self.MID} but got '{reason}'. "
+            "Limit buy should not fill when price only clips zone top half."
+        )
+        assert r == pytest.approx(0.0)
+        assert fill_ts is None
+
+    def test_short_no_fill_when_high_below_mid(self) -> None:
+        """Short: candle clips zone (high >= entry_low) but high < mid → no fill.
+
+        Candle high=99.5 clips the zone [99,101] from below but never reaches
+        the limit at mid=100.  Old code would have filled here (phantom fill).
+        """
+        df = _df(_candle(98.0, 99.5, 97.0, 98.5))  # high=99.5 < mid=100
+        reason, r, fill_ts, _ = self._sim_short(df)
+        assert reason == "no_fill", (
+            f"Phantom fill: high=99.5 < mid={self.MID} but got '{reason}'. "
+            "Limit sell should not fill when price only clips zone bottom half."
+        )
+        assert r == pytest.approx(0.0)
+        assert fill_ts is None
+
+    def test_long_fills_exactly_at_mid(self) -> None:
+        """Long fill triggers when candle low == mid_entry (inclusive boundary)."""
+        df = _df(
+            _candle(101.5, 103.0, 100.0, 101.0),  # 0: low=100.0 == mid → fills
+            _candle(100.0, 101.0,  96.0,  97.0),  # 1: SL hit
+        )
+        reason, r, fill_ts, _ = self._sim_long(df)
+        assert reason == "sl", f"Expected 'sl', got '{reason}'"
+        assert r == pytest.approx(-1.0)
+        assert fill_ts is not None
+
+    def test_short_fills_exactly_at_mid(self) -> None:
+        """Short fill triggers when candle high == mid_entry (inclusive boundary)."""
+        df = _df(
+            _candle(98.5, 100.0, 97.0, 98.5),    # 0: high=100.0 == mid → fills
+            _candle(100.0, 104.0, 100.0, 103.0), # 1: SL hit
+        )
+        reason, r, fill_ts, _ = self._sim_short(df)
+        assert reason == "sl", f"Expected 'sl', got '{reason}'"
+        assert r == pytest.approx(-1.0)
+        assert fill_ts is not None
+
+    def test_long_fills_when_low_below_mid(self) -> None:
+        """Long fills normally when low < mid_entry (price reached our limit)."""
+        df = _df(
+            _candle(101.0, 102.0, 99.5, 100.5),  # 0: low=99.5 < mid=100 → fills
+            _candle(100.0, 106.0, 100.0, 105.5), # 1: TP1 hit
+            _candle(105.5, 110.0, 105.5, 109.5), # 2: TP2 hit
+        )
+        reason, r, fill_ts, _ = self._sim_long(df)
+        assert reason == "tp1_tp2"
+        assert fill_ts is not None
+
+    def test_short_fills_when_high_above_mid(self) -> None:
+        """Short fills normally when high > mid_entry (price reached our limit)."""
+        df = _df(
+            _candle(99.0, 100.5, 98.0, 99.5),   # 0: high=100.5 > mid=100 → fills
+            _candle(99.0, 99.0,  94.0, 94.5),   # 1: TP1 hit (low=94 <= 95)
+            _candle(94.0, 94.0,  90.0, 90.5),   # 2: TP2 hit (low=90 <= 91)
+        )
+        reason, r, fill_ts, _ = self._sim_short(df)
+        assert reason == "tp1_tp2"
+        assert fill_ts is not None
+
+    def test_long_multiple_zone_clips_before_real_fill(self) -> None:
+        """Several phantom-clip candles in fill window, real fill arrives last."""
+        # MAX_FILL_CANDLES["1h"] = 2.  Both candles in window clip zone above mid.
+        df = _df(
+            _candle(101.5, 103.0, 100.3, 101.0),  # 0: low=100.3 > mid → no fill
+            _candle(101.0, 102.0, 100.1, 101.5),  # 1: low=100.1 > mid → no fill
+            _candle(100.5, 102.0, 99.5,  100.5),  # 2: low=99.5 ≤ mid → would fill
+        )
+        # Index 2 is beyond MAX_FILL=2, so result is no_fill
+        reason, r, fill_ts, _ = self._sim_long(df)
+        assert reason == "no_fill"
+        assert fill_ts is None
+
+
 # ── Edge cases ────────────────────────────────────────────────────────────────
 
 class TestEdgeCases:
