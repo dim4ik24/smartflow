@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import math
 import os
 import sys
 import time
@@ -55,12 +56,16 @@ from app.db.models import DerivativesSnapshot
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-SYMBOLS    = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+SYMBOLS    = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT",
+    "BNB/USDT", "XRP/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT",
+]
 ENTRY_TFS  = ["1h", "15m"]
 CONTEXT_TF = "4h"
 
 SMC_WINDOW   = 200   # rolling window for SMC + indicators
-STEP_CANDLES = {"1h": 24, "15m": 96}   # walk-forward step (≈ 1 day)
+# 4h real-time resolution for both TFs (was 24/96 = 1 day → missed 23/24 candles).
+STEP_CANDLES = {"1h": 4, "15m": 16}
 
 # Candles allowed to find zone touch after signal.  Per SPEC §7: signal
 # expires 2 h after generation if price never reaches the entry zone.
@@ -69,6 +74,10 @@ MAX_FILL_CANDLES = {"1h": 2, "15m": 8}
 # Max candles to hold a trade (after fill) waiting for SL or TP.
 # Trade is force-closed at mid_entry + unrealised PnL if still open.
 MAX_HOLD_CANDLES = {"1h": 200, "15m": 800}  # ~8 days
+
+# Zone deduplication cooldown: a persistent OB zone would fire every step without
+# this guard.  One signal per zone per trading day (24 × 1h or 96 × 15m candles).
+DEDUP_COOLDOWN = {"1h": 24, "15m": 96}
 
 # Score buckets for the breakdown report.
 SCORE_BUCKETS: list[tuple[int, int]] = [(55, 70), (70, 85), (85, 101)]
@@ -435,6 +444,15 @@ def scan_and_simulate(
     step      = STEP_CANDLES[tf]
     min_score = s.signal_min_score
 
+    # Zone deduplication: with small step values the same OB zone can produce
+    # a signal on every consecutive step.  Track the candle index when a zone
+    # was last signaled; suppress re-signals within DEDUP_COOLDOWN candles.
+    # Fingerprint: (side, log-price bucket at 0.25% resolution) — robust
+    # across minor SMC zone-edge drift as the rolling window advances.
+    _LOG_BUCKET = math.log(1.0025)
+    _zone_last: dict[tuple[str, int], int] = {}
+    dedup_cd = DEDUP_COOLDOWN[tf]
+
     for idx in range(SMC_WINDOW, len(df_entry) - 1, step):
         win_entry  = df_entry.iloc[idx - SMC_WINDOW : idx + 1]  # 0..T inclusive
         current_ts = win_entry.index[-1]
@@ -484,6 +502,13 @@ def scan_and_simulate(
 
         if result is None or result.score < min_score:
             continue
+
+        # Dedup guard: same OB zone signaled within cooldown window → skip
+        mid = (result.entry_low + result.entry_high) / 2.0
+        zone_key = (result.side, int(math.log(mid) / _LOG_BUCKET))
+        if idx - _zone_last.get(zone_key, -(dedup_cd + 1)) <= dedup_cd:
+            continue
+        _zone_last[zone_key] = idx
 
         # ── Simulate trade — only future candles (T+1 onward) ────────────────
         # LOOKAHEAD GUARD: df_entry.iloc[idx + 1:] never includes win_entry.
@@ -676,6 +701,17 @@ def print_report(
         print(f"  {label:7s}  {bs.n_signals:>7}  {bs.n_fills:>5}  {fr:>5}  "
               f"{wr:>5}  {ar:>5}  {pf:>5}  {dd:>6}  {sh:>6}")
 
+    # ── Score ↔ WR monotonicity ───────────────────────────────────────────────
+    active = [(lbl, bucket_stats[lbl]) for lbl in BUCKET_LABELS if bucket_stats[lbl].n_fills >= 5]
+    if len(active) >= 2:
+        wrs = [(lbl, bs.win_rate * 100) for lbl, bs in active]
+        mono = all(wrs[i][1] <= wrs[i+1][1] for i in range(len(wrs)-1))
+        arrow = "  →  ".join(f"{lbl} {wr:.0f}%" for lbl, wr in wrs)
+        tag = "monotonic ↑ (score predicts WR)" if mono else "non-monotonic (score not predictive)"
+        print(f"\n  Score↔WR: {arrow}  [{tag}]")
+    else:
+        print("\n  Score↔WR: insufficient data (need ≥5 fills per bucket for monotonicity check)")
+
     # ── By symbol ─────────────────────────────────────────────────────────────
     print(f"\n{'─'*72}")
     print("  METRICS BY SYMBOL  (filled trades only)")
@@ -854,8 +890,9 @@ def main() -> None:
             print(f"  {sym}: unavailable")
 
     # ── Walk-forward scan + simulation ───────────────────────────────────────
-    print(f"\nScanning (SMC_WINDOW={SMC_WINDOW}, step=1 day)...")
-    print("This may take 20-60 minutes for 2 years of data.\n")
+    n_combos = len(SYMBOLS) * len(ENTRY_TFS)
+    print(f"\nScanning (SMC_WINDOW={SMC_WINDOW}, step=4h, {n_combos} symbol×TF combos)...")
+    print("Expected runtime: 60-150 min (step=4 for 1h / step=16 for 15m, 8 symbols).\n")
     t_scan_start = time.time()
 
     all_trades: list[TradeRecord] = []
