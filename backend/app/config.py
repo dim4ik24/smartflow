@@ -144,6 +144,10 @@ class Settings(BaseSettings):
     # If the mid-entry is further than this the market hasn't reached the zone yet
     # ("setup not ripe") and the candidate is discarded.
     score_max_entry_atr_distance: float = 3.0
+    # Proximity guard: price must lie within this many ATRs of the OB zone boundary.
+    # 1.0 = price must be at/in the zone; 2.0-3.0 = approaching the zone is OK.
+    # Calibrated via proximity_sweep.py; lower values = stricter, fewer signals.
+    score_proximity_atr: float = 1.0
     analysis_candle_limit: int = 200
 
     @field_validator("master_encryption_key")

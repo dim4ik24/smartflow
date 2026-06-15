@@ -50,7 +50,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from app.analysis import indicators, smc
 from app.analysis.scoring import detect_structure_direction, score_setup
-from app.config import settings
+from app.config import Settings, settings
 from app.db.models import DerivativesSnapshot
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -194,8 +194,9 @@ def fetch_ohlcv(
         all_rows.extend(rows)
         last_ts = rows[-1][0]
         since_ms = last_ts + tf_ms
-        if len(rows) < _CCXT_LIMIT:
-            break
+        # Do NOT break on len(rows) < _CCXT_LIMIT: ccxt may return slightly
+        # fewer rows than requested (de-duplication, gaps) even when more data
+        # exists.  Termination is handled by `since_ms >= until_ms` above.
         time.sleep(0.25)
 
     if not all_rows:
@@ -405,15 +406,25 @@ def scan_and_simulate(
     df_entry: pd.DataFrame,
     df_4h: pd.DataFrame,
     funding_history: FundingHistory,
+    s: Settings | None = None,
 ) -> list[TradeRecord]:
     """Walk-forward scan over *df_entry*; simulate each qualifying signal.
 
     Only candles 0..T feed the scorer.  Simulation receives df_entry[T+1:].
     This is the core lookahead-safety boundary.
+
+    Parameters
+    ----------
+    s:
+        Optional Settings override (used by proximity_sweep.py to test
+        different score_proximity_atr values without reloading data).
+        Defaults to the module-level ``settings`` singleton.
     """
+    if s is None:
+        s = settings
     trades: list[TradeRecord] = []
-    step   = STEP_CANDLES[tf]
-    min_score = settings.signal_min_score
+    step      = STEP_CANDLES[tf]
+    min_score = s.signal_min_score
 
     for idx in range(SMC_WINDOW, len(df_entry) - 1, step):
         win_entry  = df_entry.iloc[idx - SMC_WINDOW : idx + 1]  # 0..T inclusive
@@ -459,6 +470,7 @@ def scan_and_simulate(
             derivatives=deriv,
             prev_derivatives=None,
             avg_sentiment=None,
+            s=s,
         )
 
         if result is None or result.score < min_score:

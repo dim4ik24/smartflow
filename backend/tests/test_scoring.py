@@ -40,6 +40,8 @@ def _settings(**overrides: object) -> Settings:
         # Test OBs have mid at OB mid ≈ price=100 → distance ≈ 0; keep the default loose
         # so existing tests are not affected by the distance guard.
         "score_max_entry_atr_distance": 3.0,
+        # Permissive proximity so tests that focus on other guards are not affected.
+        "score_proximity_atr": 1.0,
     }
     defaults.update(overrides)
     s = MagicMock(spec=Settings)

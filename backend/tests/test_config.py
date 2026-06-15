@@ -14,7 +14,7 @@ def test_settings_reads_test_env() -> None:
     assert settings.database_url == "sqlite+aiosqlite:///:memory:"
     assert settings.jwt_algorithm == "HS256"
     assert settings.jwt_expire_minutes == 15
-    assert settings.signal_min_score == 70
+    assert settings.signal_min_score == 55
     assert settings.risk_pct_min == 0.5
     assert settings.risk_pct_max == 3.0
     assert settings.max_concurrent_positions == 3

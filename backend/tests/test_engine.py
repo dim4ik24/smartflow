@@ -88,7 +88,7 @@ class TestAnalyzeSymbolOnClose:
         await db_session.flush()
 
         low_score = ScoreResult(
-            symbol="BTC/USDT", side="long", score=60,   # below min_score=70
+            symbol="BTC/USDT", side="long", score=50,   # below min_score=55
             entry_low=49900.0, entry_high=50100.0, sl=49400.0,
             tp1=51100.0, tp2=51600.0, rr=2.4,
             factors={}, zones=[],
