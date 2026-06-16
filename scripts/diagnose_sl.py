@@ -21,10 +21,13 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
 from collections import defaultdict
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +213,32 @@ def _bucket_stats(trades: list[TradeRecord]) -> dict[str, dict[str, Any]]:
     return {lbl: _stats(buckets.get(lbl, [])) for lbl in BUCKET_LABELS}
 
 
+# ── Incremental partial save ──────────────────────────────────────────────────
+
+def _save_partial_diag(
+    all_by_mult: dict[float, list[TradeRecord]],
+    completed: list[tuple[str, str]],
+    out_path: Path,
+) -> None:
+    """Persist multi-SL results after each combo (crash-safe incremental save)."""
+    payload = {
+        "partial":     True,
+        "updated_at":  datetime.now(timezone.utc).isoformat(),
+        "combos_done": [f"{s} {tf}" for s, tf in completed],
+        "sl_mults":    sorted(all_by_mult.keys()),
+        "by_mult": {
+            str(m): {
+                "n_signals": len(trades),
+                "n_fills":   sum(1 for t in trades if t.fill_ts),
+                "trades":    [asdict(t) for t in trades],
+            }
+            for m, trades in all_by_mult.items()
+        },
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, default=str), encoding="utf-8")
+
+
 # ── Noise-SL analysis ─────────────────────────────────────────────────────────
 
 def _noise_sl_report(
@@ -363,15 +392,22 @@ def print_report(
 def main() -> None:
     parser = argparse.ArgumentParser(description="SmartFlow SL placement diagnostic")
     parser.add_argument("--years", type=int, default=2)
+    parser.add_argument(
+        "--symbols", nargs="+", default=None,
+        help="Subset of symbols to scan, e.g. BTC/USDT ETH/USDT SOL/USDT",
+    )
     args = parser.parse_args()
 
-    print(f"\nSL diagnostic  —  {args.years} year(s)  —  mults={SL_MULTS}")
+    scan_symbols = args.symbols if args.symbols else SYMBOLS
+
+    print(f"\nSL diagnostic  —  {args.years} year(s)  —  mults={SL_MULTS}"
+          f"  symbols={scan_symbols}")
     print("=" * 72)
 
     # ── Load OHLCV (all from cache — no network calls expected) ──────────────
     print("\nLoading OHLCV (from cache)...")
     df_map: dict[tuple[str, str], pd.DataFrame] = {}
-    for sym in SYMBOLS:
+    for sym in scan_symbols:
         for tf in list(set(ENTRY_TFS + [CONTEXT_TF])):
             df = load_or_fetch(sym, tf, args.years)
             if not df.empty:
@@ -380,20 +416,22 @@ def main() -> None:
 
     print("\nLoading funding rates...")
     funding: dict[str, list] = {}
-    for sym in SYMBOLS:
+    for sym in scan_symbols:
         rows = _fetch_funding_sync(sym)
         funding[sym] = rows
         print(f"  {sym}: {len(rows)} settlements" if rows else f"  {sym}: unavailable")
 
     # ── Scan (one pass per symbol×TF, 3 simulations per signal) ──────────────
-    n_combos = len(SYMBOLS) * len(ENTRY_TFS)
+    n_combos = len(scan_symbols) * len(ENTRY_TFS)
     print(f"\nScanning {n_combos} combos × {len(SL_MULTS)} SL levels in one pass...")
-    print("Runtime: ~same as backtest (~90-120 min).\n")
+    print(f"Runtime: ~{n_combos * 7} min estimate.\n")
 
     all_by_mult: dict[float, list[TradeRecord]] = {m: [] for m in SL_MULTS}
+    completed_combos: list[tuple[str, str]] = []
+    partial_path = _ROOT / "results" / "diagnose_sl.partial.json"
     t_total = time.time()
 
-    for sym in SYMBOLS:
+    for sym in scan_symbols:
         for tf in ENTRY_TFS:
             if (sym, tf) not in df_map or (sym, CONTEXT_TF) not in df_map:
                 print(f"  [{sym} {tf}] SKIP — missing data")
@@ -409,9 +447,11 @@ def main() -> None:
             )
             for m, trades in by_mult.items():
                 all_by_mult[m].extend(trades)
+            completed_combos.append((sym, tf))
             n_sig   = len(by_mult[SL_MULTS[0]])
             n_fills = sum(1 for t in by_mult[SL_MULTS[0]] if t.fill_ts)
             print(f"  signals={n_sig}  fills(0.5ATR)={n_fills}  ({time.time()-t0:.0f}s)")
+            _save_partial_diag(all_by_mult, completed_combos, partial_path)
 
     elapsed = time.time() - t_total
     n_sig_total   = len(all_by_mult[SL_MULTS[0]])

@@ -780,6 +780,30 @@ def print_report(
     print()
 
 
+# ── Incremental partial save ──────────────────────────────────────────────────
+
+def _save_partial(
+    all_trades: list[TradeRecord],
+    completed: list[tuple[str, str]],
+    out_path: Path,
+) -> None:
+    """Persist current trades after each combo so a crash loses at most one combo.
+
+    Written to <out_path>.partial.json alongside the final output.  Contains
+    the raw trade list so any post-hoc analysis script can resume from it.
+    """
+    payload = {
+        "partial":       True,
+        "updated_at":    datetime.now(timezone.utc).isoformat(),
+        "combos_done":   [f"{s} {tf}" for s, tf in completed],
+        "total_signals": len(all_trades),
+        "total_fills":   sum(1 for t in all_trades if t.fill_ts),
+        "trades":        [asdict(t) for t in all_trades],
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, default=str), encoding="utf-8")
+
+
 # ── JSON export ───────────────────────────────────────────────────────────────
 
 def export_json(
@@ -896,6 +920,8 @@ def main() -> None:
     t_scan_start = time.time()
 
     all_trades: list[TradeRecord] = []
+    completed_combos: list[tuple[str, str]] = []
+    partial_path = args.out.with_suffix(".partial.json")
     for sym in SYMBOLS:
         for tf in ENTRY_TFS:
             if (sym, tf) not in df_map or (sym, CONTEXT_TF) not in df_map:
@@ -910,8 +936,10 @@ def main() -> None:
             print(f"  [{sym} {tf}] ~{n_windows} windows...", end="", flush=True)
             trades = scan_and_simulate(sym, tf, df_entry, df_4h, funding)
             all_trades.extend(trades)
+            completed_combos.append((sym, tf))
             fills = sum(1 for t in trades if t.fill_ts)
             print(f"  signals={len(trades)}  fills={fills}  ({time.time()-t0:.0f}s)")
+            _save_partial(all_trades, completed_combos, partial_path)
 
     total_scan = time.time() - t_scan_start
     print(f"\nScan complete in {total_scan:.0f}s  |  "
